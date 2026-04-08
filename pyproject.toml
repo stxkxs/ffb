@@ -1,0 +1,48 @@
+[project]
+name = "ffb"
+version = "0.1.0"
+description = "NFL data analytics and fantasy football tools (ffb)"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "nfl-data-py>=0.3.0",
+    "polars>=1.0",
+    "pyarrow>=23.0.1",
+    "textual>=3.0",
+]
+
+[project.scripts]
+ffb = "ffb.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ffb"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=9.0.3",
+]
+
+[tool.uv]
+constraint-dependencies = ["pandas>=2.0"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["SIM117"]  # nested with statements are idiomatic in Textual compose()
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_unused_imports = true
+warn_return_any = true
+disallow_untyped_defs = false
