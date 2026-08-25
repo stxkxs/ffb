@@ -9,6 +9,7 @@ import email.message
 import json
 import threading
 import urllib.error
+from collections.abc import Callable
 from typing import Any
 
 import polars as pl
@@ -123,8 +124,8 @@ def stall():
 
 def test_a_miss_fetches_from_the_importer_the_loader_names(nflverse):
     fake = nflverse(import_snap_counts=marked(1))
-    loader.load_snap_counts([2024, 2025])
-    assert fake.calls == [("import_snap_counts", ([2024, 2025],))]
+    loader.load_snap_counts([2025])
+    assert fake.calls == [("import_snap_counts", ([2025],))]
 
 
 def test_a_fresh_entry_is_served_without_a_second_fetch(nflverse):
@@ -167,17 +168,21 @@ def test_force_refresh_stores_the_frame_it_fetched(nflverse):
 # ── Cache keys ───────────────────────────────────────────────────────────────
 
 
-def test_a_season_key_names_the_dataset_and_its_seasons_ascending(nflverse, cache_dir):
+def test_a_key_names_the_dataset_and_the_one_season_it_holds(nflverse, cache_dir):
     nflverse(import_pbp_data=marked(1))
     loader.load_pbp([2025, 2024])
-    assert (cache_dir / "pbp_2024_2025.parquet").exists()
+    assert sorted(path.name for path in cache_dir.glob("*.parquet")) == [
+        "pbp_2024.parquet",
+        "pbp_2025.parquet",
+    ]
 
 
-def test_a_season_key_ignores_the_order_the_seasons_are_asked_for(nflverse):
+def test_a_season_asked_for_in_a_second_ordering_is_served_from_the_cache(nflverse):
     fake = nflverse(import_snap_counts=marked(1))
     loader.load_snap_counts([2024, 2025])
     loader.load_snap_counts([2025, 2024])
-    assert fake.names == ["import_snap_counts"]
+    # The two fetches are the first request's two seasons; the second request adds none.
+    assert fake.names == ["import_snap_counts", "import_snap_counts"]
 
 
 def test_datasets_sharing_a_season_hold_separate_entries(nflverse):
@@ -186,7 +191,7 @@ def test_datasets_sharing_a_season_hold_separate_entries(nflverse):
     assert loader.load_pbp([2025])["marker"].to_list() == [2]
 
 
-def test_distinct_season_lists_hold_separate_entries(nflverse):
+def test_distinct_seasons_of_one_dataset_hold_separate_entries(nflverse):
     nflverse(import_snap_counts=lambda seasons: marked(sum(seasons)))
     loader.load_snap_counts([2024])
     loader.load_snap_counts([2025])
@@ -473,4 +478,224 @@ def test_a_stored_entry_is_recorded_under_the_key_it_was_stored_with(nflverse, c
     nflverse(import_injuries=marked(1))
     loader.load_injuries([2024, 2025])
     meta = json.loads((cache_dir / "_meta.json").read_text())
-    assert list(meta) == ["injuries_2024_2025"]
+    assert sorted(meta) == ["injuries_2024", "injuries_2025"]
+
+
+# ── Seasons the source has not published ─────────────────────────────────────
+
+
+def season_rows(season: int) -> pl.DataFrame:
+    """A one-row frame carrying the season that produced it."""
+    return pl.DataFrame({"season": [season]})
+
+
+def undefined_name(*args: Any) -> pl.DataFrame:
+    """An importer that cannot report the download it failed.
+
+    `nfl_data_py.import_pbp_data` handles a failed download with `except Error as e`,
+    and `Error` is bound nowhere in that module, so reaching the handler raises
+    NameError over the failure that reached it. A season that importer holds no asset
+    for arrives in this shape rather than as the 404 underneath it.
+    """
+    raise NameError("name 'Error' is not defined")
+
+
+def source(
+    *published: int,
+    rows: Callable[[int], pl.DataFrame] = season_rows,
+    absent: Callable[..., pl.DataFrame] = unavailable,
+) -> Callable[[list[int]], pl.DataFrame]:
+    """An importer holding `published` and no other season.
+
+    nfl_data_py reads one release asset per season a request names and concatenates
+    them only once every read has returned, so a request naming one season with no
+    asset yields none of the seasons beside it. `absent` is the shape that failure
+    takes.
+    """
+
+    def importer(seasons: list[int]) -> pl.DataFrame:
+        for season in seasons:
+            if season not in published:
+                absent()
+        return pl.concat([rows(season) for season in seasons])
+
+    return importer
+
+
+def weekly_row(season: int) -> pl.DataFrame:
+    """One published weekly row for `season`."""
+    return published_weekly(season, 12.5)
+
+
+#: Loader name → the nfl_data_py importer it reads a season list through.
+SEASON_LOADERS = {
+    "load_injuries": "import_injuries",
+    "load_pbp": "import_pbp_data",
+    "load_rosters": "import_seasonal_rosters",
+    "load_schedules": "import_schedules",
+    "load_snap_counts": "import_snap_counts",
+}
+
+
+@pytest.mark.parametrize(("name", "importer"), sorted(SEASON_LOADERS.items()))
+def test_a_loader_taking_a_season_list_returns_the_seasons_the_source_holds(
+    nflverse, name, importer
+):
+    nflverse(**{importer: source(2025)})
+    assert getattr(loader, name)([2025, 2026])["season"].to_list() == [2025]
+
+
+@pytest.mark.parametrize(("name", "importer"), sorted(SEASON_LOADERS.items()))
+def test_a_loader_taking_a_season_list_raises_when_the_source_holds_none_of_them(
+    nflverse, name, importer
+):
+    nflverse(**{importer: source()})
+    with pytest.raises(RuntimeError, match="nflverse has not published"):
+        getattr(loader, name)([2026])
+
+
+def test_a_published_season_is_returned_beside_an_unpublished_one(nflverse):
+    nflverse(import_snap_counts=source(2025))
+    assert loader.load_snap_counts([2025, 2026])["season"].to_list() == [2025]
+
+
+def test_each_season_is_asked_for_in_its_own_request(nflverse):
+    fake = nflverse(import_snap_counts=source(2025, 2026))
+    loader.load_snap_counts([2026, 2025])
+    assert fake.calls == [
+        ("import_snap_counts", ([2025],)),
+        ("import_snap_counts", ([2026],)),
+    ]
+
+
+def test_an_unpublished_season_reported_as_a_name_error_contributes_no_rows(nflverse):
+    nflverse(import_pbp_data=source(2025, absent=undefined_name))
+    assert loader.load_pbp([2025, 2026])["season"].to_list() == [2025]
+
+
+def test_a_request_holding_no_published_season_raises(nflverse):
+    nflverse(import_snap_counts=source())
+    with pytest.raises(RuntimeError):
+        loader.load_snap_counts([2025, 2026])
+
+
+def test_a_request_holding_no_published_season_names_the_seasons(nflverse):
+    nflverse(import_snap_counts=source())
+    with pytest.raises(RuntimeError, match="2025, 2026"):
+        loader.load_snap_counts([2025, 2026])
+
+
+def test_a_request_holding_no_published_season_names_the_source(nflverse):
+    nflverse(import_snap_counts=source())
+    with pytest.raises(RuntimeError, match="nflverse has not published"):
+        loader.load_snap_counts([2025, 2026])
+
+
+def test_a_request_holding_no_published_season_names_the_dataset(nflverse):
+    nflverse(import_injuries=source())
+    with pytest.raises(RuntimeError, match="injur"):
+        loader.load_injuries([2026])
+
+
+def test_a_request_holding_no_published_season_stores_nothing(nflverse, cache_dir):
+    nflverse(import_snap_counts=source())
+    with pytest.raises(RuntimeError):
+        loader.load_snap_counts([2025, 2026])
+    assert list(cache_dir.glob("*.parquet")) == []
+
+
+@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+def test_a_failure_that_is_not_unavailability_propagates(nflverse, failure):
+    """A stalled transfer carries no information about what nflverse holds.
+
+    `TimeoutError` derives from `OSError`, the exception a 404 arrives as, so a
+    handler reading a missing season off `OSError` alone drops a season the source
+    does publish.
+    """
+
+    def refuse(seasons: list[int]) -> pl.DataFrame:
+        raise failure("upstream refused the request")
+
+    nflverse(import_snap_counts=refuse)
+    with pytest.raises(failure):
+        loader.load_snap_counts([2025, 2026])
+
+
+@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+def test_a_failure_that_is_not_unavailability_stores_nothing(nflverse, cache_dir, failure):
+    def refuse(seasons: list[int]) -> pl.DataFrame:
+        raise failure("upstream refused the request")
+
+    nflverse(import_snap_counts=refuse)
+    with pytest.raises(failure):
+        loader.load_snap_counts([2025, 2026])
+    assert list(cache_dir.glob("*.parquet")) == []
+
+
+# ── Caching a request whose seasons resolve apart ────────────────────────────
+
+
+def test_only_the_seasons_that_resolved_are_stored(nflverse, cache_dir):
+    nflverse(import_snap_counts=source(2025))
+    loader.load_snap_counts([2025, 2026])
+    assert [path.name for path in cache_dir.glob("*.parquet")] == ["snap_counts_2025.parquet"]
+
+
+def test_a_season_published_after_a_partial_load_reaches_the_result(nflverse):
+    fake = nflverse(import_snap_counts=source(2025))
+    loader.load_snap_counts([2025, 2026])
+    fake.importers["import_snap_counts"] = source(2025, 2026)
+    assert loader.load_snap_counts([2025, 2026])["season"].to_list() == [2025, 2026]
+
+
+def test_a_season_stored_by_a_partial_load_is_served_from_the_cache(nflverse):
+    fake = nflverse(import_snap_counts=source(2025))
+    loader.load_snap_counts([2025, 2026])
+    loader.load_snap_counts([2025, 2026])
+    assert fake.calls == [
+        ("import_snap_counts", ([2025],)),
+        ("import_snap_counts", ([2026],)),
+        ("import_snap_counts", ([2026],)),
+    ]
+
+
+# ── Weekly stats for a season neither asset covers ───────────────────────────
+
+
+def test_a_season_covered_by_neither_weekly_asset_nor_play_by_play_is_skipped(nflverse):
+    nflverse(
+        import_weekly_data=source(2025, rows=weekly_row),
+        import_pbp_data=source(absent=undefined_name),
+        import_seasonal_rosters=source(),
+    )
+    assert loader.load_weekly_stats([2025, 2026])["season"].to_list() == [2025]
+
+
+def test_a_derived_season_survives_beside_a_season_neither_asset_covers(nflverse, pbp, rosters):
+    nflverse(
+        import_weekly_data=source(),
+        import_pbp_data=lambda seasons: pbp if seasons == [2025] else unavailable(),
+        import_seasonal_rosters=lambda seasons: rosters if seasons == [2025] else unavailable(),
+    )
+    weekly = loader.load_weekly_stats([2025, 2026])
+    assert weekly["season"].unique().to_list() == [2025]
+
+
+def test_weekly_stats_covered_by_neither_asset_in_any_season_raise(nflverse):
+    nflverse(
+        import_weekly_data=source(),
+        import_pbp_data=source(absent=undefined_name),
+        import_seasonal_rosters=source(),
+    )
+    with pytest.raises(RuntimeError, match="nflverse has not published"):
+        loader.load_weekly_stats([2025, 2026])
+
+
+def test_a_season_covered_by_neither_asset_stores_nothing(nflverse, cache_dir):
+    nflverse(
+        import_weekly_data=source(2025, rows=weekly_row),
+        import_pbp_data=source(absent=undefined_name),
+        import_seasonal_rosters=source(),
+    )
+    loader.load_weekly_stats([2025, 2026])
+    assert [path.name for path in cache_dir.glob("*.parquet")] == ["weekly_stats_2025.parquet"]

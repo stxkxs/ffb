@@ -103,9 +103,10 @@ takes no command-line flags.
 | Size ceiling | 2 GiB | `MAX_CACHE_BYTES` in `src/ffb/data/cache.py` |
 | Download timeout | 120 seconds per download | `_DOWNLOAD_TIMEOUT` in `src/ffb/data/loader.py` |
 
-Each download lands as one Parquet file named for its cache key — `snap_counts_2024_2025.parquet`,
-`pbp_2024_2025.parquet`, `player_ids.parquet` — beside a `_meta.json` holding the write and
-last-access time of every entry. A read of an entry written more than six hours earlier
+Each download lands as one Parquet file named for its cache key — `snap_counts_2025.parquet`,
+`pbp_2025.parquet`, `player_ids.parquet` — beside a `_meta.json` holding the write and
+last-access time of every entry. A dataset published per season is keyed per season, so a
+tool asking for two seasons reads or writes two entries. A read of an entry written more than six hours earlier
 counts as a miss and triggers a fresh download. Writing an entry reaps records whose Parquet
 file is gone and Parquet files no record claims, then evicts entries least recently read
 until the directory fits under the ceiling.
@@ -123,9 +124,10 @@ read and overwrites every key the tool loads.
 
 **The first load takes minutes.** Opening a tool downloads whole-season Parquet assets from
 nflverse. Red Zone pulls two seasons of play-by-play, and so does any tool whose season has
-no published weekly-stats asset; `src/ffb/data/cache.py` sizes the cache around a two-season
-play-by-play entry landing near 100 MB. Nothing is on disk before the first download
-succeeds, so the wait falls once per dataset and then not again for six hours.
+no published weekly-stats asset; play-by-play is the largest asset the cache holds, which is
+what `MAX_CACHE_BYTES` in `src/ffb/data/cache.py` is sized around. Nothing is on disk before
+the first download succeeds, so the wait falls once per dataset season and then not again
+for six hours.
 
 **Watching a load.** The loading pane names what is downloading and counts elapsed time as
 `MM:SS`, updated once a second. `nfl_data_py` downloads a release asset in one blocking call
@@ -146,13 +148,37 @@ only those opens from disk. Retrying the tool that timed out means pressing **Re
 which forces every dataset it loads — including the ones already cached — to download
 again.
 
+**A season nflverse has not published.** The season label rolls over on 1 September,
+while nflverse publishes a season's play-by-play, snap counts, weekly stats and injuries
+only once its games have been played — so for the opening days of September every tool asks
+for a season the source answers `HTTP Error 404` for. That season contributes no rows and
+the seasons beside it render: each loader resolves its season list one season at a time, so
+an unpublished season costs only itself.
+
+The skip reaches the interface, because every screen builds its season filter from the
+seasons its data carries rows for. The unpublished season is absent from the
+filter, and the filter opens on the newest season that has data. Start/Sit and Trade Value
+read their season options off the results for the same reason, not off the schedule:
+nflverse publishes a schedule months before the season opens, so a schedule alone would
+offer a season nothing can be projected or ranked for.
+
+Nothing negative is cached, so the season joins the filter on the first load after nflverse
+publishes it. The price is one failed request per unpublished asset per load.
+
+**`Failed to load data: nflverse has not published snap counts for season 2026`.** Every
+season the tool asked for is unpublished, so the load has nothing to render. The message
+names the dataset and the seasons. Loads whose datasets are published are unaffected: a tool
+fails only on the dataset it could not resolve at all.
+
 **Any other `Failed to load data:` toast** carries the message the download itself raised. A
-season nflverse has not published a weekly-stats asset for is not an error: those weeks are
-derived from play-by-play, at the cost of a play-by-play download.
+season nflverse has not published a weekly-stats asset for is not an error on its own: those
+weeks are derived from play-by-play, at the cost of a play-by-play download, and the season
+drops out only when neither asset covers it.
 
 **A table shows a sentence where rows would be.** An empty result renders as a message
 naming which emptiness it is — a filter combination that matches nothing, a season and week
-too early to rank, or a search with no split to report.
+too early to rank, a season with no completed week behind it, or a search with no split to
+report.
 
 ## Development
 

@@ -28,7 +28,7 @@ share one shell, one download path and one disk cache; each tool otherwise stand
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │  data/seasons.py — which seasons to ask for                           │
-│  data/loader.py  — one _cached() call per dataset, 120 s per download │
+│  data/loader.py  — one cache entry per dataset season, 120 s each     │
 │  data/cache.py   — TTL, atomic write, LRU ceiling, ~/.fantasy/cache   │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -111,18 +111,32 @@ single hop: everything crossing it is in that object.
 Three modules sit under every `fetch()`.
 
 `data/seasons.py` answers which seasons to ask for. nflverse labels a season by the calendar
-year it opens in, so a date resolves to a season only once the month is known.
-`current_season()` and `recent_seasons()` both accept an injected date, which is what makes
-the arithmetic testable and keeps season lists out of the screens.
+year it opens in, so a date resolves to a season only once the month is known. `season_for()`
+resolves a date to a label and `recent_seasons()` takes the injected date, which is what
+makes the arithmetic testable and keeps season lists out of the screens. The module resolves
+the calendar and nothing else: the label it returns can name a season nflverse has published
+no per-game rows for.
 
 `data/loader.py` is seven loaders over one `_cached(key, fetch, *args, force_refresh)`
 helper. `force_refresh` skips the cache read, not the write, which is precisely what the
-Refresh button promises. Each loader owns one cache key; a per-season key sorts its seasons
-so that any ordering names the same entry. `_download` runs each fetch on its own daemon
-thread and gives up after the timeout, so one stalled transfer neither delays a concurrent
-download nor eats the next one's budget. A thread cannot be interrupted, so the abandoned
-worker runs to completion with nothing left to hand its result to; being a daemon keeps it
-from holding the interpreter open at exit.
+Refresh button promises. A loader taking a season list resolves it through `_by_season`, one
+season and one cache key per season, and concatenates what came back. That split is what
+lets a published season render beside an unpublished one: `nfl_data_py` satisfies a
+multi-season request only once every season in it has been read, so a single 404 inside a
+batched request costs every season beside it. A request that resolves no season at all
+raises, naming the seasons and the dataset, rather than handing an engine a frame with no
+columns. `_download` runs each fetch on its own daemon thread and gives up after the
+timeout, so one stalled transfer neither delays a concurrent download nor eats the next
+one's budget. A thread cannot be interrupted, so the abandoned worker runs to completion
+with nothing left to hand its result to; being a daemon keeps it from holding the
+interpreter open at exit.
+
+A screen builds its season filter from the seasons its loaded frames carry rows for, never
+from the season list it asked for. An unpublished season therefore leaves the filter, and
+the filter defaults to the newest season that has data. Start/Sit and Trade Value load a
+schedule alongside their per-game frames and nflverse publishes a schedule months before
+the season opens, so both read their season options off the results rather than off the
+schedule.
 
 `data/cache.py` is a directory of Parquet files with a JSON metadata sidecar. Entries are
 written to a temporary file and renamed into place, so a crash leaves one complete file —
@@ -165,6 +179,7 @@ other six.
    inside the `ContentSwitcher` with `id=view_id`. The sidebar entry, the switch and the
    first-show activation all key off that id.
 
-A tool that needs a dataset no loader covers adds one loader to `data/loader.py`: a cache key
-and a `_cached` call. Everything else — the timeout, the atomic write, the eviction — comes
-with it.
+A tool that needs a dataset no loader covers adds one loader to `data/loader.py`: a `_cached`
+call for a dataset with no season, a `_by_season` call for one published per season.
+Everything else — the timeout, the atomic write, the eviction, the tolerance of a season the
+source has yet to publish — comes with it.

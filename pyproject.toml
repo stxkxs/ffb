@@ -76,7 +76,7 @@ show_missing = true
 skip_covered = true
 # Floor set from the measured total. `uv run pytest --cov` enforces it; a plain
 # `uv run pytest` collects no coverage and so does not.
-fail_under = 86
+fail_under = 87
 exclude_also = [
     "raise NotImplementedError",
 ]

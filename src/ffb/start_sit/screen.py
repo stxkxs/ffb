@@ -28,8 +28,9 @@ COLUMNS = (
     "Verdict",
 )
 
-#: Seasons loaded. The season filter offers one entry per loaded season, so this
-#: window sets how far back a lineup decision can be reviewed.
+#: Seasons loaded, which is how far back a lineup decision can be reviewed. The season
+#: filter offers the loaded seasons that carry results, so a season the schedule covers
+#: before a game of it has been played is not among them.
 SEASON_WINDOW = 2
 
 #: Stands in for the table when the engine projects nobody for the selected week.
@@ -44,6 +45,12 @@ NO_MATCHES = (
     "Widen either filter to see this week's projections."
 )
 
+#: Stands in for the table when no loaded season carries a week of results to project.
+NO_RESULTS = (
+    "No completed weeks to project from. nflverse publishes a season's weekly stats "
+    "once its games have been played."
+)
+
 
 @dataclass(frozen=True)
 class StartSitData:
@@ -51,6 +58,23 @@ class StartSitData:
 
     weekly_stats: pl.DataFrame
     schedules: pl.DataFrame
+
+
+def _weeks_played(weekly_stats: pl.DataFrame, season: int) -> list[int]:
+    """Regular-season weeks of `season` the weekly stats carry results for, in order.
+
+    A projection reads the results through the week it names, so a week with no results
+    behind it projects nobody. Reading the weeks off the results rather than off the
+    schedule keeps the week filter to the weeks that can project: a schedule carries
+    every week of a season from the moment nflverse publishes it, months before the
+    first of them is played.
+    """
+    return sorted(
+        weekly_stats.filter((pl.col("season") == season) & (pl.col("season_type") == "REG"))["week"]
+        .unique()
+        .drop_nulls()
+        .to_list()
+    )
 
 
 def _projection_row(row: dict[str, Any]) -> tuple[str, ...]:
@@ -119,12 +143,16 @@ class StartSitView(ToolView):
     # ── filters ──────────────────────────────────────────────
 
     def _populate_filters(self) -> None:
-        if self._schedules is None:
+        if self._schedules is None or self._weekly_stats is None:
             return
 
         reg = self._schedules.filter(pl.col("game_type") == "REG")
 
-        seasons = sorted(reg["season"].unique().drop_nulls().to_list())
+        seasons = sorted(
+            season
+            for season in reg["season"].unique().drop_nulls().to_list()
+            if _weeks_played(self._weekly_stats, season)
+        )
         season_select = self.query_one("#ss-filter-season", Select)
         season_select.set_options([(str(s), s) for s in seasons])
         if seasons:
@@ -133,7 +161,7 @@ class StartSitView(ToolView):
         self._update_week_and_team_options()
 
     def _update_week_and_team_options(self) -> None:
-        if self._schedules is None:
+        if self._schedules is None or self._weekly_stats is None:
             return
         season = self.selected("ss-filter-season")
         if season is None:
@@ -141,7 +169,7 @@ class StartSitView(ToolView):
 
         reg = self._schedules.filter((pl.col("season") == season) & (pl.col("game_type") == "REG"))
 
-        weeks = sorted(reg["week"].unique().drop_nulls().to_list())
+        weeks = _weeks_played(self._weekly_stats, season)
         week_select = self.query_one("#ss-filter-week", Select)
         week_select.set_options([(f"Week {w}", w) for w in weeks])
         # The week with the most recent results is the one a lineup decision is about.
@@ -167,9 +195,11 @@ class StartSitView(ToolView):
 
         season = self.selected("ss-filter-season")
         week = self.selected("ss-filter-week")
-        # Both selects carry the season and week integers taken from the schedule until
-        # a load fills their options, and a filter holding no selection projects nothing.
+        # Both filters hold no selection until a load fills their options, and a load
+        # that reached no completed week fills neither.
         if not isinstance(season, int) or not isinstance(week, int):
+            self._projections = None
+            self.fill_table("ss-table", pl.DataFrame(), _projection_row, NO_RESULTS)
             return
 
         self._projections = compute_start_sit(self._weekly_stats, self._schedules, season, week)

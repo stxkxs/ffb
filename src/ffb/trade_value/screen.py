@@ -34,15 +34,22 @@ COLUMNS = (
     "Value",
 )
 
-#: Seasons the load asks for, which is also what the season filter offers. Production,
-#: schedule and usage read the one season selected; the health component reads injury
-#: weeks across every season loaded, so a second season buys a longer availability
-#: history.
+#: Seasons the load asks for. Production, schedule and usage read the one season
+#: selected; the health component reads injury weeks across every season loaded, so a
+#: second season buys a longer availability history. The season filter offers the
+#: loaded seasons a ranking can run on, which is narrower: a season nflverse has
+#: published a schedule for carries no results until its games have been played.
 SEASON_WINDOW = 2
 
 #: Weeks of results a ranking rests on. The engine ranks nobody below this, so the week
 #: filter offers no week below it either.
 MIN_WEEKS_PLAYED = 3
+
+#: Stands in for the table when no loaded season carries enough played weeks to rank.
+NO_RANKABLE_WEEKS = (
+    f"No season has the {MIN_WEEKS_PLAYED} completed weeks a ranking rests on. "
+    "nflverse publishes a season's weekly stats once its games have been played."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +61,23 @@ class TradeValueData:
     schedules: pl.DataFrame
     injuries: pl.DataFrame
     ids: pl.DataFrame
+
+
+def _rankable_weeks(weekly: pl.DataFrame, season: int) -> list[int]:
+    """Regular-season weeks of `season` a ranking can run through, in order.
+
+    A trade value is worth what a player brings over the weeks left, so the last week
+    of the regular season is out along with the weeks too early to rank. The weeks come
+    off the results rather than off the schedule: a schedule carries every week of a
+    season from the moment nflverse publishes it, months before the first is played.
+    """
+    played = (
+        weekly.filter((pl.col("season") == season) & (pl.col("season_type") == "REG"))["week"]
+        .unique()
+        .drop_nulls()
+        .to_list()
+    )
+    return sorted(week for week in played if MIN_WEEKS_PLAYED <= week < REGULAR_SEASON_WEEKS)
 
 
 def _value_row(row: dict[str, Any]) -> tuple[str, ...]:
@@ -125,7 +149,11 @@ class TradeValueView(ToolView):
 
         reg = data.schedules.filter(pl.col("game_type") == "REG")
 
-        seasons = sorted(reg["season"].unique().drop_nulls().to_list())
+        seasons = sorted(
+            season
+            for season in reg["season"].unique().drop_nulls().to_list()
+            if _rankable_weeks(data.weekly, season)
+        )
         season_select = self.query_one("#tv-filter-season", Select)
         season_select.set_options([(str(s), s) for s in seasons])
         if seasons:
@@ -141,18 +169,7 @@ class TradeValueView(ToolView):
         if season is None:
             return
 
-        # Weeks the season has results for.
-        played = (
-            data.weekly.filter((pl.col("season") == season) & (pl.col("season_type") == "REG"))[
-                "week"
-            ]
-            .unique()
-            .drop_nulls()
-            .to_list()
-        )
-        # A trade value is worth what a player brings over the weeks left, so the last
-        # week of the regular season is out along with the weeks too early to rank.
-        weeks = sorted([w for w in played if MIN_WEEKS_PLAYED <= w < REGULAR_SEASON_WEEKS])
+        weeks = _rankable_weeks(data.weekly, season)
         week_select = self.query_one("#tv-filter-week", Select)
         week_select.set_options([(f"Week {w}", w) for w in weeks])
         if weeks:
@@ -175,15 +192,11 @@ class TradeValueView(ToolView):
 
         season = self.selected("tv-filter-season")
         week = self.selected("tv-filter-week")
-        # Both filters hold no selection until a load fills their options.
+        # Both filters hold no selection until a load fills their options, and a load
+        # that reached no rankable week fills neither.
         if not isinstance(season, int) or not isinstance(week, int):
             self._values = None
-            self.fill_table(
-                "tv-table",
-                pl.DataFrame(),
-                _value_row,
-                "Pick a season and a week to rank rest-of-season trade value.",
-            )
+            self.fill_table("tv-table", pl.DataFrame(), _value_row, NO_RANKABLE_WEEKS)
             return
 
         self._values = compute_trade_values(
