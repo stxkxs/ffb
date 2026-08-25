@@ -9,10 +9,11 @@ from ffb.red_zone.screen import RedZoneView
 from ffb.snap_share.screen import SnapShareView
 from ffb.start_sit.screen import StartSitView
 from ffb.trade_value.screen import TradeValueView
+from ffb.ui.base import ToolView
 from ffb.waiver_wire.screen import WaiverWireView
 
 
-class FFBApp(App):
+class FFBApp(App[None]):
     """Main application shell with sidebar navigation."""
 
     TITLE = "FFB"
@@ -74,16 +75,14 @@ class FFBApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#snap-share").activate()
+        self.query_one("#snap-share", ToolView).activate()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         tool_id = event.item.id
         if tool_id and tool_id.startswith("nav-"):
             view_id = tool_id.removeprefix("nav-")
             self.query_one(ContentSwitcher).current = view_id
-            view = self.query_one(f"#{view_id}")
-            if hasattr(view, "activate"):
-                view.activate()
+            self.query_one(f"#{view_id}", ToolView).activate()
 
 
 def main() -> None:

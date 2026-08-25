@@ -2,72 +2,88 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import polars as pl
-from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
 from textual.suggester import SuggestFromList
-from textual.widget import Widget
-from textual.widgets import (
-    Button,
-    DataTable,
-    Input,
-    LoadingIndicator,
-    Select,
-    Static,
-)
+from textual.widgets import DataTable, Input, Select, Static
 
 from ffb.data.loader import load_player_ids, load_snap_counts, load_weekly_stats
-from ffb.injury_impact.engine import compute_injury_impact, get_searchable_players
+from ffb.data.seasons import recent_seasons
+from ffb.injury_impact.engine import PlayerInfo, compute_injury_impact, get_searchable_players
+from ffb.ui.base import ALL, ToolView
 
 COLUMNS = (
-    "Teammate", "Pos", "Tm", "Szn",
-    "Gm W/", "Gm W/O",
-    "FPts W/", "FPts W/O", "Δ FPts",
-    "Tgt W/", "Tgt W/O",
-    "Tch W/", "Tch W/O",
+    "Teammate",
+    "Pos",
+    "Tm",
+    "Szn",
+    "Gm W/",
+    "Gm W/O",
+    "FPts W/",
+    "FPts W/O",
+    "Δ FPts",
+    "Tgt W/",
+    "Tgt W/O",
+    "Tch W/",
+    "Tch W/O",
     "Conf",
 )
 
+#: How many seasons the splits draw on. A star misses games rarely, so a window
+#: shorter than this leaves most searches with no absence to compare against.
+SEASON_WINDOW = 3
 
-class InjuryImpactView(Widget):
+#: Stands in for the table until a search runs.
+PROMPT_MESSAGE = "Search a player to see how their teammates' usage shifted while they sat out."
+
+
+@dataclass(frozen=True)
+class BaseData:
+    """The frames every search runs against, plus the names the search suggests."""
+
+    snaps: pl.DataFrame
+    weekly_stats: pl.DataFrame
+    player_ids: pl.DataFrame
+    players: list[str]
+
+
+def _fixed(value: float | None, *, signed: bool = False) -> str:
+    """Format a per-game average to one decimal, or mark it absent."""
+    if value is None:
+        return "—"
+    return f"{value:+.1f}" if signed else f"{value:.1f}"
+
+
+def _row_cells(row: dict[str, Any]) -> tuple[str, ...]:
+    """Map one teammate split to its table cells, in `COLUMNS` order."""
+    return (
+        row["teammate"] or "—",
+        row["position"] or "—",
+        row["team"],
+        str(row["season"]),
+        str(row["games_with"]),
+        str(row["games_without"]),
+        _fixed(row["fpts_with"]),
+        _fixed(row["fpts_without"]),
+        _fixed(row["delta_fpts"], signed=True),
+        _fixed(row["tgt_with"]),
+        _fixed(row["tgt_without"]),
+        _fixed(row["touches_with"]),
+        _fixed(row["touches_without"]),
+        row["confidence"],
+    )
+
+
+class InjuryImpactView(ToolView):
     """Teammate usage shifts when stars miss games."""
 
+    ID_PREFIX = "ii"
+    LOAD_LABEL = "Downloading snap counts, weekly stats and player IDs"
+
     DEFAULT_CSS = """
-    InjuryImpactView {
-        height: 1fr;
-        width: 1fr;
-    }
-
-    #ii-loading {
-        height: 1fr;
-    }
-
-    #ii-content {
-        height: 1fr;
-    }
-
-    .filter-bar {
-        height: auto;
-        max-height: 5;
-        padding: 1;
-        background: $surface-darken-1;
-    }
-
-    .filter-bar Input {
-        width: 2fr;
-        margin-right: 1;
-    }
-
-    .filter-bar Select {
-        width: 1fr;
-        margin-right: 1;
-    }
-
-    .filter-bar #ii-btn-refresh {
-        margin-left: 1;
-    }
-
     #ii-player-info {
         height: auto;
         padding: 0 1;
@@ -76,129 +92,116 @@ class InjuryImpactView(Widget):
     }
     """
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._snaps: pl.DataFrame | None = None
-        self._weekly_stats: pl.DataFrame | None = None
-        self._player_ids: pl.DataFrame | None = None
-        self._activated = False
-        self._initializing = True
+        self._data: BaseData | None = None
 
-    def compose(self) -> ComposeResult:
-        yield LoadingIndicator(id="ii-loading")
-        with Vertical(id="ii-content"):
-            with Horizontal(classes="filter-bar"):
-                yield Input(
-                    placeholder="Search player...",
-                    id="ii-search",
-                )
-                yield Select[str]([], prompt="Season", id="ii-filter-season")
-                yield Button("Refresh", id="ii-btn-refresh", variant="primary")
-            yield Static("", id="ii-player-info")
-            yield DataTable(id="ii-table")
+    def compose_content(self) -> ComposeResult:
+        yield from self.compose_filter_bar(
+            Input(placeholder="Search player...", id="ii-search"),
+            Select[str]([], prompt="Season", id="ii-filter-season"),
+        )
+        yield Static("", id="ii-player-info")
+        yield DataTable(id="ii-table")
 
     def on_mount(self) -> None:
-        self.query_one("#ii-content").display = False
         table = self.query_one("#ii-table", DataTable)
         table.add_columns(*COLUMNS)
         table.cursor_type = "row"
 
-    def activate(self) -> None:
-        """Load base data on first activation."""
-        if not self._activated:
-            self._activated = True
-            self._fetch_base_data()
+    # ── load ─────────────────────────────────────────────────
 
-    @work(thread=True, exclusive=True)
-    def _fetch_base_data(self, force_refresh: bool = False) -> None:
-        try:
-            snaps = load_snap_counts([2023, 2024, 2025], force_refresh=force_refresh)
-            weekly = load_weekly_stats([2023, 2024, 2025], force_refresh=force_refresh)
-            ids = load_player_ids(force_refresh=force_refresh)
-            players = get_searchable_players(snaps)
-            self.app.call_from_thread(
-                self._on_base_data_loaded, snaps, weekly, ids, players
-            )
-        except Exception as e:
-            self.app.call_from_thread(self._on_data_error, str(e))
+    def fetch(self, force_refresh: bool) -> BaseData:
+        seasons = recent_seasons(SEASON_WINDOW)
+        snaps = load_snap_counts(seasons, force_refresh=force_refresh)
+        weekly = load_weekly_stats(seasons, force_refresh=force_refresh)
+        ids = load_player_ids(force_refresh=force_refresh)
+        return BaseData(snaps, weekly, ids, get_searchable_players(snaps))
 
-    def _on_base_data_loaded(
-        self,
-        snaps: pl.DataFrame,
-        weekly: pl.DataFrame,
-        ids: pl.DataFrame,
-        players: list[str],
-    ) -> None:
-        self._snaps = snaps
-        self._weekly_stats = weekly
-        self._player_ids = ids
+    def apply(self, payload: BaseData) -> None:
+        self._data = payload
 
-        # Set up search autocomplete
         search = self.query_one("#ii-search", Input)
-        search.suggester = SuggestFromList(players, case_sensitive=False)
+        search.suggester = SuggestFromList(payload.players, case_sensitive=False)
 
-        # Populate season filter
-        self._initializing = True
-        reg_snaps = snaps.filter(snaps["game_type"] == "REG")
+        reg_snaps = payload.snaps.filter(pl.col("game_type") == "REG")
         seasons = sorted(reg_snaps["season"].unique().drop_nulls().to_list())
         season_select = self.query_one("#ii-filter-season", Select)
-        season_select.set_options([("All", "All")] + [(str(s), str(s)) for s in seasons])
-        season_select.value = "All"
-        self._initializing = False
+        season_select.set_options(self.all_options(str(season) for season in seasons))
+        season_select.value = ALL
 
-        self.query_one("#ii-loading").display = False
-        self.query_one("#ii-content").display = True
-
-    def _on_data_error(self, error: str) -> None:
-        self.query_one("#ii-loading").display = False
-        self.notify(f"Failed to load data: {error}", severity="error", timeout=10)
+        self.query_one("#ii-player-info", Static).update("")
+        self.fill_table("ii-table", pl.DataFrame(), _row_cells, PROMPT_MESSAGE)
 
     # ── search ───────────────────────────────────────────────
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "ii-search" and event.value.strip():
-            self._run_search(event.value.strip())
-
-    @work(thread=True, exclusive=True)
-    def _run_search(self, player_name: str) -> None:
-        if self._snaps is None or self._weekly_stats is None or self._player_ids is None:
+        if event.input.id != "ii-search":
             return
+        player_name = event.value.strip()
+        if player_name:
+            self._search(player_name)
 
-        snaps = self._snaps
-        weekly = self._weekly_stats
+    def _search(self, player_name: str) -> None:
+        """Start a search, or say why the data it needs is not there.
 
-        # Apply season filter
-        season_val = self.app.call_from_thread(self._get_season_filter)
-        if season_val and season_val != "All":
-            season_int = int(season_val)
-            snaps = snaps.filter(pl.col("season") == season_int)
-            weekly = weekly.filter(pl.col("season") == season_int)
-
-        info, df = compute_injury_impact(
-            player_name, snaps, weekly, self._player_ids
+        The tool is reachable with no data after a cancelled or failed load, so the
+        absence gets an answer rather than a search that does nothing.
+        """
+        data = self._data
+        if data is None:
+            self.notify(
+                "No data loaded. Press Refresh to download snap counts, "
+                "weekly stats and player IDs.",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        season = self.narrowing("ii-filter-season")
+        # A search started while an earlier one runs renders its own result: the shared
+        # worker drops the result of the search it supersedes, so the table answers the
+        # term in the search box.
+        self.run_off_thread(
+            lambda: self._splits(player_name, data, season),
+            lambda result: self._on_search_complete(player_name, *result),
+            self._on_search_error,
+            group="ii-search",
         )
-        self.app.call_from_thread(self._on_search_complete, player_name, info, df)
 
-    def _get_season_filter(self) -> str:
-        val = self.query_one("#ii-filter-season", Select).value
-        return str(val) if val is not Select.BLANK else "All"
+    def _splits(
+        self,
+        player_name: str,
+        data: BaseData,
+        season: str | None,
+    ) -> tuple[PlayerInfo | None, pl.DataFrame]:
+        """Compute one player's teammate splits, off the UI thread.
+
+        `season` narrows both frames to one season; None reads every season loaded.
+        """
+        snaps = data.snaps
+        weekly = data.weekly_stats
+        if season is not None:
+            snaps = snaps.filter(pl.col("season") == int(season))
+            weekly = weekly.filter(pl.col("season") == int(season))
+        return compute_injury_impact(player_name, snaps, weekly, data.player_ids)
 
     def _on_search_complete(
         self,
         player_name: str,
-        info: dict | None,
+        info: PlayerInfo | None,
         df: pl.DataFrame,
     ) -> None:
         info_widget = self.query_one("#ii-player-info", Static)
-        table = self.query_one("#ii-table", DataTable)
-        table.clear()
 
         if info is None:
             info_widget.update("")
-            self.notify(
-                f"No missed games found for {player_name}",
-                severity="warning",
-                timeout=5,
+            self.fill_table(
+                "ii-table",
+                pl.DataFrame(),
+                _row_cells,
+                f"No missed-game splits for {player_name}. Either no player of that "
+                f"name took an offensive snap in the selected seasons, or they missed "
+                f"too few games to compare.",
             )
             return
 
@@ -206,37 +209,21 @@ class InjuryImpactView(Widget):
             f"{info['name']}  |  {info['team']}  |  {info['position']}  |  "
             f"{info['games_missed']} games missed in {info['season']}"
         )
+        self.fill_table(
+            "ii-table",
+            df,
+            _row_cells,
+            f"{player_name} missed games, but no teammate recorded stats both with "
+            f"and without them.",
+        )
 
-        for row in df.iter_rows(named=True):
-            table.add_row(
-                row["teammate"] or "—",
-                row["position"] or "—",
-                row["team"],
-                str(row["season"]),
-                str(row["games_with"]),
-                str(row["games_without"]),
-                f"{row['fpts_with']:.1f}" if row["fpts_with"] is not None else "—",
-                f"{row['fpts_without']:.1f}" if row["fpts_without"] is not None else "—",
-                f"{row['delta_fpts']:+.1f}" if row["delta_fpts"] is not None else "—",
-                f"{row['tgt_with']:.1f}" if row["tgt_with"] is not None else "—",
-                f"{row['tgt_without']:.1f}" if row["tgt_without"] is not None else "—",
-                f"{row['touches_with']:.1f}" if row["touches_with"] is not None else "—",
-                f"{row['touches_without']:.1f}" if row["touches_without"] is not None else "—",
-                row["confidence"],
-            )
+    def _on_search_error(self, error: str) -> None:
+        self.report_error(f"Search failed: {error}")
 
     # ── events ───────────────────────────────────────────────
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if self._initializing:
-            return
-        # Re-run search if one is active
-        search = self.query_one("#ii-search", Input)
-        if search.value.strip():
-            self._run_search(search.value.strip())
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "ii-btn-refresh":
-            self.query_one("#ii-content").display = False
-            self.query_one("#ii-loading").display = True
-            self._fetch_base_data(force_refresh=True)
+    def filter_changed(self, filter_id: str | None) -> None:
+        """Run the search box's term again against the season the filter reads."""
+        search = self.query_one("#ii-search", Input).value.strip()
+        if search:
+            self._search(search)

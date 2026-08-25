@@ -2,147 +2,98 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import polars as pl
-from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widget import Widget
-from textual.widgets import (
-    Button,
-    DataTable,
-    LoadingIndicator,
-    Select,
-    Static,
-    TabbedContent,
-    TabPane,
-)
+from textual.widgets import DataTable, Select, Static, TabbedContent, TabPane
 
 from ffb.data.loader import load_snap_counts
+from ffb.data.seasons import recent_seasons
 from ffb.snap_share.engine import compute_trends
+from ffb.ui.base import ALL, ToolView
 
-COLUMNS = ("Player", "Pos", "Team", "Wk", "Snap%", "Avg", "Δ", "Vel", "Trend")
+#: "vs Avg" holds the week's snap share minus the rolling average of the weeks before
+#: it, and "Vel" the per-week slope across the window.
+COLUMNS = ("Player", "Pos", "Team", "Wk", "Snap%", "Avg", "vs Avg", "Vel", "Trend")
+
+#: Seasons the filter offers, counting back from the most recent. Rolling windows group
+#: by season, so each season is trended from its own week 1.
+SEASON_COUNT = 2
+
+#: Trends that count as an upward alert.
+RISING_TRENDS = ("rising", "breakout")
+
+#: Tables that share the trend column layout.
+TABLE_IDS = ("sn-rising-table", "sn-falling-table", "sn-all-table")
 
 
-class SnapShareView(Widget):
+def _trend_row(row: dict[str, Any]) -> tuple[str, ...]:
+    """Format one trend row as table cells, rendering an absent measure as an em dash."""
+    snap = row["snap_pct"]
+    avg = row["rolling_avg"]
+    delta = row["delta"]
+    velocity = row["velocity"]
+    return (
+        row["player"],
+        row["position"],
+        row["team"],
+        str(row["week"]),
+        f"{snap:.1f}%" if snap is not None else "—",
+        f"{avg:.1f}%" if avg is not None else "—",
+        f"{delta:+.1f}" if delta is not None else "—",
+        f"{velocity:+.1f}" if velocity is not None else "—",
+        row["trend"],
+    )
+
+
+class SnapShareView(ToolView):
     """Snap count trend tracker with alerts and full player table."""
 
-    DEFAULT_CSS = """
-    SnapShareView {
-        height: 1fr;
-        width: 1fr;
-    }
+    ID_PREFIX = "sn"
+    LOAD_LABEL = "Downloading snap counts"
 
-    #sn-loading {
-        height: 1fr;
-    }
-
-    #sn-content {
-        height: 1fr;
-    }
-
-    .filter-bar {
-        height: auto;
-        max-height: 5;
-        padding: 1;
-        background: $surface-darken-1;
-    }
-
-    .filter-bar Select {
-        width: 1fr;
-        margin-right: 1;
-    }
-
-    .filter-bar #sn-btn-refresh {
-        margin-left: 1;
-    }
-
-    .alert-panels {
-        height: 1fr;
-    }
-
-    .alert-panel {
-        width: 1fr;
-        margin: 0 1;
-    }
-
-    .panel-header-rising {
-        color: $success;
-        text-style: bold;
-        padding: 1 0 0 1;
-    }
-
-    .panel-header-falling {
-        color: $error;
-        text-style: bold;
-        padding: 1 0 0 1;
-    }
-    """
-
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._trends: pl.DataFrame | None = None
-        self._activated = False
-        self._initializing = True
 
-    def compose(self) -> ComposeResult:
-        yield LoadingIndicator(id="sn-loading")
-        with Vertical(id="sn-content"):
-            with Horizontal(classes="filter-bar"):
-                yield Select[str](
-                    [("All", "All"), ("QB", "QB"), ("RB", "RB"), ("WR", "WR"), ("TE", "TE")],
-                    value="All",
-                    id="sn-filter-position",
-                )
-                yield Select[str]([], prompt="Team", id="sn-filter-team")
-                yield Select[int]([], prompt="Season", id="sn-filter-season")
-                yield Select[int]([], prompt="Week", id="sn-filter-week")
-                yield Button("Refresh", id="sn-btn-refresh", variant="primary")
-            with TabbedContent():
-                with TabPane("Alerts", id="sn-tab-alerts"):
-                    with Horizontal(classes="alert-panels"):
-                        with Vertical(classes="alert-panel"):
-                            yield Static("▲ Rising", classes="panel-header-rising")
-                            yield DataTable(id="sn-rising-table")
-                        with Vertical(classes="alert-panel"):
-                            yield Static("▼ Falling", classes="panel-header-falling")
-                            yield DataTable(id="sn-falling-table")
-                with TabPane("All Players", id="sn-tab-all"):
-                    yield DataTable(id="sn-all-table")
+    def compose_content(self) -> ComposeResult:
+        yield from self.compose_filter_bar(
+            self.position_select(),
+            Select[str]([], prompt="Team", id="sn-filter-team"),
+            Select[int]([], prompt="Season", id="sn-filter-season"),
+            Select[int]([], prompt="Week", id="sn-filter-week"),
+        )
+        with TabbedContent():
+            with TabPane("Alerts", id="sn-tab-alerts"):
+                with Horizontal(classes="alert-panels"):
+                    with Vertical(classes="alert-panel"):
+                        yield Static("▲ Rising", classes="panel-header-rising")
+                        yield DataTable(id="sn-rising-table")
+                    with Vertical(classes="alert-panel"):
+                        yield Static("▼ Falling", classes="panel-header-falling")
+                        yield DataTable(id="sn-falling-table")
+            with TabPane("All Players", id="sn-tab-all"):
+                yield DataTable(id="sn-all-table")
 
     def on_mount(self) -> None:
-        self.query_one("#sn-content").display = False
-        for tid in ("sn-rising-table", "sn-falling-table", "sn-all-table"):
-            table = self.query_one(f"#{tid}", DataTable)
+        for table_id in TABLE_IDS:
+            table = self.query_one(f"#{table_id}", DataTable)
             table.add_columns(*COLUMNS)
             table.cursor_type = "row"
 
-    def activate(self) -> None:
-        """Load data on first activation."""
-        if not self._activated:
-            self._activated = True
-            self._fetch_data()
+    # ── data ─────────────────────────────────────────────────
 
-    @work(thread=True, exclusive=True)
-    def _fetch_data(self, force_refresh: bool = False) -> None:
-        try:
-            snaps = load_snap_counts([2024, 2025], force_refresh=force_refresh)
-            trends = compute_trends(snaps)
-            self.app.call_from_thread(self._on_data_loaded, trends)
-        except Exception as e:
-            self.app.call_from_thread(self._on_data_error, str(e))
+    def fetch(self, force_refresh: bool) -> pl.DataFrame:
+        """Download snap counts and trend every player's share of them."""
+        snaps = load_snap_counts(recent_seasons(SEASON_COUNT), force_refresh=force_refresh)
+        return compute_trends(snaps)
 
-    def _on_data_loaded(self, trends: pl.DataFrame) -> None:
+    def apply(self, trends: pl.DataFrame) -> None:
         self._trends = trends
-        self._initializing = True
         self._populate_filters()
-        self._initializing = False
         self._apply_filters()
-        self.query_one("#sn-loading").display = False
-        self.query_one("#sn-content").display = True
-
-    def _on_data_error(self, error: str) -> None:
-        self.query_one("#sn-loading").display = False
-        self.notify(f"Failed to load data: {error}", severity="error", timeout=10)
 
     # ── filters ──────────────────────────────────────────────
 
@@ -152,33 +103,40 @@ class SnapShareView(Widget):
 
         teams = sorted(self._trends["team"].unique().drop_nulls().to_list())
         team_select = self.query_one("#sn-filter-team", Select)
-        team_select.set_options([("All", "All")] + [(t, t) for t in teams])
-        team_select.value = "All"
+        team_select.set_options(self.all_options(teams))
+        team_select.value = ALL
 
         seasons = sorted(self._trends["season"].unique().drop_nulls().to_list())
         season_select = self.query_one("#sn-filter-season", Select)
-        season_select.set_options([(str(s), s) for s in seasons])
-        season_select.value = seasons[-1]
+        season_select.set_options([(str(season), season) for season in seasons])
+        if seasons:
+            season_select.value = seasons[-1]
 
         self._update_week_options()
 
     def _update_week_options(self) -> None:
+        """Offer the weeks the selected season carries, defaulting to the latest.
+
+        Rebuilding the option list on every call keeps the filter from advertising a
+        week the selected season has no rows for.
+        """
         if self._trends is None:
             return
-        season = self.query_one("#sn-filter-season", Select).value
-        if season is Select.BLANK:
-            return
-        weeks = sorted(
-            self._trends.filter(pl.col("season") == season)["week"]
-            .unique()
-            .drop_nulls()
-            .to_list()
+        season = self.selected("sn-filter-season")
+        weeks: list[int] = (
+            []
+            if season is None
+            else sorted(
+                self._trends.filter(pl.col("season") == season)["week"]
+                .unique()
+                .drop_nulls()
+                .to_list()
+            )
         )
-        if not weeks:
-            return
         week_select = self.query_one("#sn-filter-week", Select)
-        week_select.set_options([(f"Week {w}", w) for w in weeks])
-        week_select.value = weeks[-1]
+        week_select.set_options([(f"Week {week}", week) for week in weeks])
+        if weeks:
+            week_select.value = weeks[-1]
 
     def _apply_filters(self) -> None:
         if self._trends is None:
@@ -186,20 +144,20 @@ class SnapShareView(Widget):
 
         df = self._trends
 
-        pos = self.query_one("#sn-filter-position", Select).value
-        if pos not in ("All", Select.BLANK):
+        pos = self.narrowing("sn-filter-position")
+        if pos is not None:
             df = df.filter(pl.col("position") == pos)
 
-        team = self.query_one("#sn-filter-team", Select).value
-        if team not in ("All", Select.BLANK):
+        team = self.narrowing("sn-filter-team")
+        if team is not None:
             df = df.filter(pl.col("team") == team)
 
-        season = self.query_one("#sn-filter-season", Select).value
-        if season is not Select.BLANK:
+        season = self.selected("sn-filter-season")
+        if season is not None:
             df = df.filter(pl.col("season") == season)
 
-        week = self.query_one("#sn-filter-week", Select).value
-        if week is not Select.BLANK:
+        week = self.selected("sn-filter-week")
+        if week is not None:
             df = df.filter(pl.col("week") == week)
 
         self._update_tables(df)
@@ -207,49 +165,33 @@ class SnapShareView(Widget):
     # ── tables ───────────────────────────────────────────────
 
     def _update_tables(self, df: pl.DataFrame) -> None:
-        rising = df.filter(
-            pl.col("trend").is_in(["rising", "breakout"])
-        ).sort("velocity", descending=True)
-        self._fill_table("sn-rising-table", rising)
+        rising = df.filter(pl.col("trend").is_in(RISING_TRENDS)).sort("velocity", descending=True)
+        self.fill_table(
+            "sn-rising-table",
+            rising,
+            _trend_row,
+            "No rising or breakout players for the selected season, week, position and team.",
+        )
 
         falling = df.filter(pl.col("trend") == "falling").sort("velocity")
-        self._fill_table("sn-falling-table", falling)
+        self.fill_table(
+            "sn-falling-table",
+            falling,
+            _trend_row,
+            "No falling players for the selected season, week, position and team.",
+        )
 
-        self._fill_table("sn-all-table", df.sort("delta", descending=True))
-
-    def _fill_table(self, table_id: str, df: pl.DataFrame) -> None:
-        table = self.query_one(f"#{table_id}", DataTable)
-        table.clear()
-        for row in df.iter_rows(named=True):
-            snap = row["snap_pct"]
-            avg = row["rolling_avg"]
-            delta = row["delta"]
-            vel = row["velocity"]
-            table.add_row(
-                row["player"],
-                row["position"],
-                row["team"],
-                str(row["week"]),
-                f"{snap:.1f}%" if snap is not None else "—",
-                f"{avg:.1f}%" if avg is not None else "—",
-                f"{delta:+.1f}" if delta is not None else "—",
-                f"{vel:+.1f}" if vel is not None else "—",
-                row["trend"],
-            )
+        self.fill_table(
+            "sn-all-table",
+            df.sort("delta", descending=True),
+            _trend_row,
+            "No snap counts for the selected season, week, position and team.",
+        )
 
     # ── events ───────────────────────────────────────────────
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if self._initializing:
-            return
-        if event.select.id == "sn-filter-season":
-            self._initializing = True
+    def filter_changed(self, filter_id: str | None) -> None:
+        """Re-filter, rebuilding the week options first where the season moved."""
+        if filter_id == "sn-filter-season":
             self._update_week_options()
-            self._initializing = False
         self._apply_filters()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "sn-btn-refresh":
-            self.query_one("#sn-content").display = False
-            self.query_one("#sn-loading").display = True
-            self._fetch_data(force_refresh=True)

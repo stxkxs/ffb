@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import polars as pl
-from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widget import Widget
-from textual.widgets import (
-    Button,
-    DataTable,
-    LoadingIndicator,
-    Select,
-)
+from textual.widgets import DataTable, Select
 
 from ffb.data.loader import (
     load_injuries,
@@ -21,230 +16,252 @@ from ffb.data.loader import (
     load_snap_counts,
     load_weekly_stats,
 )
-from ffb.trade_value.engine import compute_trade_values
+from ffb.data.seasons import recent_seasons
+from ffb.trade_value.engine import REGULAR_SEASON_WEEKS, compute_trade_values
+from ffb.ui.base import ALL, ToolView
 
 COLUMNS = (
-    "Rank", "Player", "Pos", "Team",
-    "PPG", "GP", "Sched", "Snap%",
-    "Health", "Bye", "Value",
+    "Rank",
+    "Player",
+    "Pos",
+    "Team",
+    "PPG",
+    "GP",
+    "Sched",
+    "Snap%",
+    "Health",
+    "Bye",
+    "Value",
 )
 
+#: Seasons the load asks for, which is also what the season filter offers. Production,
+#: schedule and usage read the one season selected; the health component reads injury
+#: weeks across every season loaded, so a second season buys a longer availability
+#: history.
+SEASON_WINDOW = 2
 
-class TradeValueView(Widget):
+#: Weeks of results a ranking rests on. The engine ranks nobody below this, so the week
+#: filter offers no week below it either.
+MIN_WEEKS_PLAYED = 3
+
+
+@dataclass(frozen=True, slots=True)
+class TradeValueData:
+    """The frames one load hands to the view."""
+
+    weekly: pl.DataFrame
+    snaps: pl.DataFrame
+    schedules: pl.DataFrame
+    injuries: pl.DataFrame
+    ids: pl.DataFrame
+
+
+def _value_row(row: dict[str, Any]) -> tuple[str, ...]:
+    """Map one ranked player to the cells of `COLUMNS`."""
+    bye = row["bye_week"]
+    return (
+        str(row["rank"]),
+        row["player"],
+        row["position"],
+        row["team"],
+        f"{row['ppg']:.1f}",
+        str(row["games_played"]),
+        f"{row['sched_mult']:.2f}x",
+        f"{row['avg_snap_pct']:.0f}%",
+        f"{row['health']:.0%}",
+        str(int(bye)) if bye is not None else "—",
+        f"{row['trade_value']:.1f}",
+    )
+
+
+class TradeValueView(ToolView):
     """Rest-of-season trade value chart."""
 
-    DEFAULT_CSS = """
-    TradeValueView {
-        height: 1fr;
-        width: 1fr;
-    }
+    ID_PREFIX = "tv"
+    LOAD_LABEL = "Loading weekly stats, snap counts, schedules and injuries"
 
-    #tv-loading {
-        height: 1fr;
-    }
-
-    #tv-content {
-        height: 1fr;
-    }
-
-    .filter-bar {
-        height: auto;
-        max-height: 5;
-        padding: 1;
-        background: $surface-darken-1;
-    }
-
-    .filter-bar Select {
-        width: 1fr;
-        margin-right: 1;
-    }
-
-    .filter-bar #tv-btn-refresh {
-        margin-left: 1;
-    }
-    """
-
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._data: TradeValueData | None = None
         self._values: pl.DataFrame | None = None
-        self._activated = False
-        self._initializing = True
 
-    def compose(self) -> ComposeResult:
-        yield LoadingIndicator(id="tv-loading")
-        with Vertical(id="tv-content"):
-            with Horizontal(classes="filter-bar"):
-                yield Select[str](
-                    [("All", "All"), ("QB", "QB"), ("RB", "RB"), ("WR", "WR"), ("TE", "TE")],
-                    value="All",
-                    id="tv-filter-position",
-                )
-                yield Select[str]([], prompt="Team", id="tv-filter-team")
-                yield Select[int]([], prompt="Season", id="tv-filter-season")
-                yield Select[int]([], prompt="As of Week", id="tv-filter-week")
-                yield Button("Refresh", id="tv-btn-refresh", variant="primary")
-            yield DataTable(id="tv-table")
+    def compose_content(self) -> ComposeResult:
+        yield from self.compose_filter_bar(
+            self.position_select(),
+            Select[str]([], prompt="Team", id="tv-filter-team"),
+            Select[int]([], prompt="Season", id="tv-filter-season"),
+            Select[int]([], prompt="As of Week", id="tv-filter-week"),
+        )
+        yield DataTable(id="tv-table")
 
     def on_mount(self) -> None:
-        self.query_one("#tv-content").display = False
         table = self.query_one("#tv-table", DataTable)
         table.add_columns(*COLUMNS)
         table.cursor_type = "row"
 
-    def activate(self) -> None:
-        if not self._activated:
-            self._activated = True
-            self._fetch_data()
+    # ── load ─────────────────────────────────────────────────
 
-    @work(thread=True, exclusive=True)
-    def _fetch_data(self, force_refresh: bool = False) -> None:
-        try:
-            weekly = load_weekly_stats([2024, 2025], force_refresh=force_refresh)
-            snaps = load_snap_counts([2024, 2025], force_refresh=force_refresh)
-            schedules = load_schedules([2024, 2025], force_refresh=force_refresh)
-            injuries = load_injuries([2024, 2025], force_refresh=force_refresh)
-            ids = load_player_ids(force_refresh=force_refresh)
-            self.app.call_from_thread(
-                self._on_data_loaded, weekly, snaps, schedules, injuries, ids
-            )
-        except Exception as e:
-            self.app.call_from_thread(self._on_data_error, str(e))
+    def fetch(self, force_refresh: bool) -> TradeValueData:
+        seasons = recent_seasons(SEASON_WINDOW)
+        return TradeValueData(
+            weekly=load_weekly_stats(seasons, force_refresh=force_refresh),
+            snaps=load_snap_counts(seasons, force_refresh=force_refresh),
+            schedules=load_schedules(seasons, force_refresh=force_refresh),
+            injuries=load_injuries(seasons, force_refresh=force_refresh),
+            ids=load_player_ids(force_refresh=force_refresh),
+        )
 
-    def _on_data_loaded(
-        self,
-        weekly: pl.DataFrame,
-        snaps: pl.DataFrame,
-        schedules: pl.DataFrame,
-        injuries: pl.DataFrame,
-        ids: pl.DataFrame,
-    ) -> None:
-        self._weekly = weekly
-        self._snaps = snaps
-        self._schedules = schedules
-        self._injuries = injuries
-        self._ids = ids
-
-        self._initializing = True
+    def apply(self, payload: TradeValueData) -> None:
+        self._data = payload
         self._populate_filters()
-        self._initializing = False
         self._compute_values()
-        self.query_one("#tv-loading").display = False
-        self.query_one("#tv-content").display = True
-
-    def _on_data_error(self, error: str) -> None:
-        self.query_one("#tv-loading").display = False
-        self.notify(f"Failed to load data: {error}", severity="error", timeout=10)
 
     # ── filters ──────────────────────────────────────────────
 
     def _populate_filters(self) -> None:
-        if self._schedules is None:
+        data = self._data
+        if data is None:
             return
 
-        reg = self._schedules.filter(pl.col("game_type") == "REG")
+        reg = data.schedules.filter(pl.col("game_type") == "REG")
 
         seasons = sorted(reg["season"].unique().drop_nulls().to_list())
         season_select = self.query_one("#tv-filter-season", Select)
         season_select.set_options([(str(s), s) for s in seasons])
-        season_select.value = seasons[-1]
+        if seasons:
+            season_select.value = seasons[-1]
 
         self._update_week_and_team_options()
 
     def _update_week_and_team_options(self) -> None:
-        if self._weekly is None or self._schedules is None:
+        data = self._data
+        if data is None:
             return
-        season = self.query_one("#tv-filter-season", Select).value
-        if season is Select.BLANK:
+        season = self.selected("tv-filter-season")
+        if season is None:
             return
 
-        # Weeks with data
-        played = self._weekly.filter(
-            (pl.col("season") == season) & (pl.col("season_type") == "REG")
-        )["week"].unique().drop_nulls().to_list()
-        # Only show weeks where games remain (exclude final week)
-        weeks = sorted([w for w in played if 3 <= w < 18])
+        # Weeks the season has results for.
+        played = (
+            data.weekly.filter((pl.col("season") == season) & (pl.col("season_type") == "REG"))[
+                "week"
+            ]
+            .unique()
+            .drop_nulls()
+            .to_list()
+        )
+        # A trade value is worth what a player brings over the weeks left, so the last
+        # week of the regular season is out along with the weeks too early to rank.
+        weeks = sorted([w for w in played if MIN_WEEKS_PLAYED <= w < REGULAR_SEASON_WEEKS])
         week_select = self.query_one("#tv-filter-week", Select)
         week_select.set_options([(f"Week {w}", w) for w in weeks])
-        week_select.value = weeks[-1] if weeks else Select.BLANK
+        if weeks:
+            week_select.value = weeks[-1]
 
-        reg = self._schedules.filter(
-            (pl.col("season") == season) & (pl.col("game_type") == "REG")
-        )
+        reg = data.schedules.filter((pl.col("season") == season) & (pl.col("game_type") == "REG"))
         teams = sorted(
             set(reg["home_team"].unique().drop_nulls().to_list())
             | set(reg["away_team"].unique().drop_nulls().to_list())
         )
         team_select = self.query_one("#tv-filter-team", Select)
-        team_select.set_options([("All", "All")] + [(t, t) for t in teams])
-        team_select.value = "All"
+        team_select.set_options(self.all_options(teams))
+        team_select.value = ALL
 
     def _compute_values(self) -> None:
-        season = self.query_one("#tv-filter-season", Select).value
-        week = self.query_one("#tv-filter-week", Select).value
-        if season is Select.BLANK or week is Select.BLANK:
+        """Rank the selected season through the selected week."""
+        data = self._data
+        if data is None:
+            return
+
+        season = self.selected("tv-filter-season")
+        week = self.selected("tv-filter-week")
+        # Both filters hold no selection until a load fills their options.
+        if not isinstance(season, int) or not isinstance(week, int):
+            self._values = None
+            self.fill_table(
+                "tv-table",
+                pl.DataFrame(),
+                _value_row,
+                "Pick a season and a week to rank rest-of-season trade value.",
+            )
             return
 
         self._values = compute_trade_values(
-            self._weekly, self._snaps, self._schedules,
-            self._injuries, self._ids,
-            season=int(season), current_week=int(week),
+            data.weekly,
+            data.snaps,
+            data.schedules,
+            data.injuries,
+            data.ids,
+            season=season,
+            current_week=week,
         )
         self._apply_filters()
 
     def _apply_filters(self) -> None:
-        if self._values is None:
+        values = self._values
+        if values is None:
             return
 
-        df = self._values
+        season = self.selected("tv-filter-season")
+        week = self.selected("tv-filter-week")
 
-        pos = self.query_one("#tv-filter-position", Select).value
-        if pos not in ("All", Select.BLANK):
+        # Emptiness is settled before any column is named: a row-less result owes the
+        # caller no columns, and naming one on such a frame raises.
+        if values.height == 0:
+            self.fill_table("tv-table", values, _value_row, _unranked_message(season, week))
+            return
+
+        pos = self.narrowing("tv-filter-position")
+        team = self.narrowing("tv-filter-team")
+
+        df = values
+        if pos is not None:
             df = df.filter(pl.col("position") == pos)
-
-        team = self.query_one("#tv-filter-team", Select).value
-        if team not in ("All", Select.BLANK):
+        if team is not None:
             df = df.filter(pl.col("team") == team)
 
-        self._fill_table(df)
-
-    # ── table ────────────────────────────────────────────────
-
-    def _fill_table(self, df: pl.DataFrame) -> None:
-        table = self.query_one("#tv-table", DataTable)
-        table.clear()
-        for i, row in enumerate(df.iter_rows(named=True), 1):
-            bye = row["bye_week"]
-            table.add_row(
-                str(i),
-                row["player"],
-                row["position"],
-                row["team"],
-                f"{row['ppg']:.1f}",
-                str(row["games_played"]),
-                f"{row['sched_mult']:.2f}x",
-                f"{row['avg_snap_pct']:.0f}%",
-                f"{row['health']:.0%}",
-                str(int(bye)) if bye is not None else "—",
-                f"{row['trade_value']:.1f}",
-            )
+        self.fill_table(
+            "tv-table",
+            df.with_row_index("rank", offset=1),
+            _value_row,
+            _no_match_message(pos, team, season, week),
+        )
 
     # ── events ───────────────────────────────────────────────
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if self._initializing:
-            return
-        if event.select.id in ("tv-filter-season", "tv-filter-week"):
-            if event.select.id == "tv-filter-season":
-                self._initializing = True
+    def filter_changed(self, filter_id: str | None) -> None:
+        """Rank again for a season or week change; re-filter the ranking for the rest.
+
+        A season change rebuilds the week and team options first, so the ranking is
+        computed for a week the selected season played.
+        """
+        if filter_id in ("tv-filter-season", "tv-filter-week"):
+            if filter_id == "tv-filter-season":
                 self._update_week_and_team_options()
-                self._initializing = False
             self._compute_values()
         else:
             self._apply_filters()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "tv-btn-refresh":
-            self.query_one("#tv-content").display = False
-            self.query_one("#tv-loading").display = True
-            self._activated = False
-            self.activate()
+
+def _unranked_message(season: Any, week: Any) -> str:
+    """Say why a chosen season and week rank nobody."""
+    return (
+        f"No trade values for {season} week {week}. A ranking needs "
+        f"{MIN_WEEKS_PLAYED} weeks of results behind it and a week still to play."
+    )
+
+
+def _no_match_message(pos: Any, team: Any, season: Any, week: Any) -> str:
+    """Name the filters that narrowed a populated ranking down to nothing.
+
+    `pos` and `team` are what those filters narrow to, so None names neither.
+    """
+    if pos is not None and team is not None:
+        who = f"{pos} on {team}"
+    elif pos is not None:
+        who = f"{pos} players"
+    elif team is not None:
+        who = f"{team} players"
+    else:
+        who = "players"
+    return f"No {who} in the {season} week {week} rankings."

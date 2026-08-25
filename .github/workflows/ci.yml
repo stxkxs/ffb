@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and select Python 3.12
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the locked dependency set, and reject a uv.lock that disagrees with pyproject.toml
+        run: uv sync --locked --all-groups
+
+      - name: Reject lint violations
+        run: uv run ruff check .
+
+      - name: Reject unformatted source
+        run: uv run ruff format --check .
+
+      - name: Reject type errors under src
+        run: uv run mypy src
+
+      - name: Reject a failing test, or coverage under the floor in pyproject.toml
+        run: uv run pytest --cov
+
+      - name: Reject a package that does not build
+        run: uv build
+
+      - name: Reject a known vulnerability in any locked dependency
+        run: |
+          uv export --frozen --no-emit-project --all-groups \
+            --format requirements.txt -o "${RUNNER_TEMP}/requirements.txt"
+          uv run --with pip-audit pip-audit --strict --disable-pip \
+            -r "${RUNNER_TEMP}/requirements.txt"
