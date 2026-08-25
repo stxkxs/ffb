@@ -14,6 +14,9 @@ uv sync
 uv run ffb
 ```
 
+The sidebar lists six tools. A tool downloads its data the first time it is opened;
+`docs/architecture.md` describes how the tools, the engines and the data layer fit together.
+
 ## Tools
 
 ### Snap Share
@@ -32,12 +35,12 @@ Team and player red zone conversion analysis. Red zone behavior is the strongest
 - Filter by position, team, season
 
 ### Injury Impact
-When a player gets injured, instantly see the historical fantasy impact on their teammates. Search by player name to see how teammate stats changed when that player was active vs inactive.
+When a player gets injured, see the historical fantasy impact on their teammates. Search by player name to compare teammate stats across the weeks that player was active against the weeks they sat out.
 
-- Search autocomplete across all offensive players
+- Search autocomplete across every offensive player in the loaded snap counts
 - Fantasy points, targets, and touches with/without the player
-- Delta and confidence indicators based on sample size
-- Multi-season lookback (2023-2025)
+- Delta per teammate, and a confidence tier keyed to the size of the without-sample: High at 7 games or more, Med at 4 or more, Low below that
+- Three-season lookback
 
 ### Start/Sit
 Matchup-based start/sit projections. Cross-references player baselines against opponent defensive rankings by position to produce matchup-adjusted fantasy point projections.
@@ -56,13 +59,31 @@ Ranks players by a composite usage score combining snap share, target share, and
 - Filter by position, team, season, week
 
 ### Trade Value
-Rest-of-season trade value chart. Normalizes player value from multiple factors into a single 0-100 score for evaluating trades.
+Rest-of-season trade value chart. Ranks the offensive players of one season through one chosen week and scales the field so the strongest player scores 100.
 
-- Production (40%): season PPG × games remaining
-- Schedule strength (20%): avg opponent defensive ranking for remaining games
-- Usage (20%): snap share percentage
-- Health (10%): injury history discount from missed games
-- Bye week (10%): penalty if bye is still upcoming
+A player is ranked when the chosen week is week 3 or later, the 18-week regular season
+still has a week left to play, and the player has at least three games of results. Four
+components carry the score:
+
+- **Production (50%)** — season PPG multiplied by games remaining, divided by the largest
+  such figure in the field. Games remaining is the weeks left in the regular season, less
+  one when the player's team still has its bye ahead.
+- **Schedule strength (20%)** — average fantasy points the remaining opponents allow at the
+  player's position, divided by the league average allowed at that position, then scaled
+  across the field between its own minimum and maximum. A team whose remaining opponents
+  have no ranking takes a neutral 1.00 multiplier.
+- **Usage (20%)** — average offensive snap share over the weeks played, as a fraction of
+  100. A player with no snap-count row takes 50%.
+- **Health (10%)** — one minus the fraction of the loaded seasons' regular-season weeks the
+  player was listed Out, that fraction capped at 0.5 so health never falls below 0.5. A
+  player with no Out week takes 1.0.
+
+A bye week is not a component of its own: it enters through games remaining, which is the
+only term that separates two players with the same PPG.
+
+The weighted sum is rescaled so the field's best score reads 100.0. The table lists PPG,
+games played, the schedule multiplier, snap share, health, bye week and the value, and
+filters by position, team, season and as-of week.
 
 ## Stack
 
@@ -70,6 +91,79 @@ Rest-of-season trade value chart. Normalizes player value from multiple factors 
 - **Processing:** `polars`
 - **TUI:** `textual`
 
-## Data Caching
+## Configuration
 
-Downloaded data is cached locally at `~/.fantasy/cache/` with a 6-hour TTL. Hit the Refresh button in any tool to force a fresh download.
+Every setting is a module constant; the application reads no environment variables and
+takes no command-line flags.
+
+| Setting | Value | Defined in |
+| --- | --- | --- |
+| Cache directory | `~/.fantasy/cache` | `CACHE_DIR` in `src/ffb/data/cache.py` |
+| Freshness window | 6 hours | `DEFAULT_TTL` in `src/ffb/data/cache.py` |
+| Size ceiling | 2 GiB | `MAX_CACHE_BYTES` in `src/ffb/data/cache.py` |
+| Download timeout | 120 seconds per download | `_DOWNLOAD_TIMEOUT` in `src/ffb/data/loader.py` |
+
+Each download lands as one Parquet file named for its cache key — `snap_counts_2024_2025.parquet`,
+`pbp_2024_2025.parquet`, `player_ids.parquet` — beside a `_meta.json` holding the write and
+last-access time of every entry. A read of an entry written more than six hours earlier
+counts as a miss and triggers a fresh download. Writing an entry reaps records whose Parquet
+file is gone and Parquet files no record claims, then evicts entries least recently read
+until the directory fits under the ceiling.
+
+To clear the cache, delete the directory:
+
+```bash
+rm -rf ~/.fantasy/cache
+```
+
+To replace only what one tool reads, press **Refresh** in that tool. Refresh skips the cache
+read and overwrites every key the tool loads.
+
+## Troubleshooting
+
+**The first load takes minutes.** Opening a tool downloads whole-season Parquet assets from
+nflverse. Red Zone pulls two seasons of play-by-play, and so does any tool whose season has
+no published weekly-stats asset; `src/ffb/data/cache.py` sizes the cache around a two-season
+play-by-play entry landing near 100 MB. Nothing is on disk before the first download
+succeeds, so the wait falls once per dataset and then not again for six hours.
+
+**Watching a load.** The loading pane names what is downloading and counts elapsed time as
+`MM:SS`, updated once a second. `nfl_data_py` downloads a release asset in one blocking call
+and reports no progress, so elapsed time is the only honest readout — there is no percentage
+or bar.
+
+**Stopping a load.** Press the **Cancel** button, or `escape` while the load is in flight —
+the binding is offered in the footer only while there is something to cancel. Cancelling
+discards the result and restores the previous content, and posts `Load cancelled.` A download
+already under way cannot be interrupted, so it runs to completion or to its timeout on a
+background daemon thread with nothing left to hand its result to.
+
+**`Failed to load data: Download timed out after 120s. Check your network connection.`** One
+download did not finish inside its 120-second budget. The budget is per download, not per
+tool: a tool that loads five datasets gives each its own 120 seconds, and the first to run
+out ends the whole load. Datasets that completed are already cached, so a tool that reads
+only those opens from disk. Retrying the tool that timed out means pressing **Refresh**,
+which forces every dataset it loads — including the ones already cached — to download
+again.
+
+**Any other `Failed to load data:` toast** carries the message the download itself raised. A
+season nflverse has not published a weekly-stats asset for is not an error: those weeks are
+derived from play-by-play, at the cost of a play-by-play download.
+
+**A table shows a sentence where rows would be.** An empty result renders as a message
+naming which emptiness it is — a filter combination that matches nothing, a season and week
+too early to rank, or a search with no split to report.
+
+## Development
+
+```bash
+uv sync                 # install the project and the dev group
+uv run ruff check .     # lint
+uv run mypy src         # type-check
+uv run pytest           # unit tests
+uv run pytest --cov     # unit tests, and the coverage floor in pyproject.toml
+uv run ffb              # run the TUI
+```
+
+Tests run the cache against a redirected cache directory, and the engines, the views and
+the app against the synthetic league in `tests/conftest.py`. No test reaches the network.
