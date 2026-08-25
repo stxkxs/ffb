@@ -15,8 +15,9 @@ log = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".fantasy" / "cache"
 DEFAULT_TTL = 6 * 3600  # 6 hours
-# Play-by-play for a pair of seasons lands around 100 MB, so this holds a working
-# set of many season tuples while bounding what the cache can take from the disk.
+# Play-by-play is the largest entry a season writes, by an order of magnitude over
+# every other dataset, so this holds a working set of many seasons while bounding
+# what the cache can take from the disk.
 MAX_CACHE_BYTES = 2 * 1024**3  # 2 GiB
 
 # Partial writes carry this suffix, which keeps them out of the "*.parquet" glob

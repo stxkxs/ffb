@@ -19,6 +19,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.pilot import Pilot
 from textual.widgets import Button, DataTable, Select, Static
+from textual.widgets._select import InvalidSelectValueError
 
 from ffb.injury_impact import screen as injury_impact_screen
 from ffb.red_zone import screen as red_zone_screen
@@ -47,6 +48,13 @@ LEAGUE_STARTERS = len(LEAGUE_TEAMS) * len(LEAGUE_POSITIONS)
 
 #: Stands in for the probe's table when a result carries no rows.
 EMPTY_MESSAGE = "No rows for these filters."
+
+#: A season a schedule covers and no result reaches, as nflverse holds one between
+#: publishing a season's schedule and its first game being played.
+UNPLAYED_SEASON = LATEST_SEASON + 1
+
+#: Weeks of results a season part-way through carries.
+WEEKS_PLAYED = 5
 
 
 # ── the six tools ────────────────────────────────────────────────────────────
@@ -850,3 +858,173 @@ async def test_every_table_is_paired_with_an_empty_state_label(
 
         assert tables, f"{tool.name} renders no table"
         assert [tid for tid in tables if not view.query(f"#{tid}-empty")] == []
+
+
+# ── season filters ───────────────────────────────────────────────────────────
+
+
+def unplayed(schedules: pl.DataFrame) -> pl.DataFrame:
+    """`schedules` with a copy of its latest season relabelled `UNPLAYED_SEASON`.
+
+    nflverse publishes a season's schedule months before its opening kickoff, so a
+    schedule covering a season no per-game asset carries is what the source holds
+    between the calendar reaching a season and its first game being played.
+    """
+    latest = schedules.filter(pl.col("season") == LATEST_SEASON)
+    return pl.concat(
+        [
+            schedules,
+            latest.with_columns(
+                pl.lit(UNPLAYED_SEASON).cast(schedules["season"].dtype).alias("season")
+            ),
+        ]
+    )
+
+
+def frames_for(
+    monkeypatch: pytest.MonkeyPatch,
+    weekly: pl.DataFrame,
+    schedules: pl.DataFrame,
+    fixtures: dict[str, pl.DataFrame],
+) -> None:
+    """Stub every loader with the league fixtures, `weekly` and `schedules` overriding."""
+    stub_loaders(
+        monkeypatch, {**fixtures, "load_weekly_stats": weekly, "load_schedules": schedules}, []
+    )
+
+
+@pytest.fixture()
+def fixture_frames(
+    league_snap_counts: pl.DataFrame,
+    league_weekly_stats: pl.DataFrame,
+    player_ids: pl.DataFrame,
+    full_season_schedules: pl.DataFrame,
+    injuries: pl.DataFrame,
+    pbp: pl.DataFrame,
+    rosters: pl.DataFrame,
+) -> dict[str, pl.DataFrame]:
+    """The frame each loader answers with, keyed by loader name."""
+    return loader_frames(
+        league_snap_counts,
+        league_weekly_stats,
+        player_ids,
+        full_season_schedules,
+        injuries,
+        pbp,
+        rosters,
+    )
+
+
+@piloted
+async def test_start_sit_offers_no_season_the_weekly_stats_have_no_week_of(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """The season a schedule covers and no result reaches is absent from the filter."""
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"],
+        unplayed(fixture_frames["load_schedules"]),
+        fixture_frames,
+    )
+    view = start_sit_screen.StartSitView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        season = view.query_one("#ss-filter-season", Select)
+
+        assert season.value == LATEST_SEASON
+        with pytest.raises(InvalidSelectValueError):
+            season.value = UNPLAYED_SEASON
+
+
+@piloted
+async def test_trade_value_offers_no_season_the_weekly_stats_have_no_week_of(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """The season a schedule covers and no result reaches is absent from the filter."""
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"],
+        unplayed(fixture_frames["load_schedules"]),
+        fixture_frames,
+    )
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        season = view.query_one("#tv-filter-season", Select)
+
+        assert season.value == LATEST_SEASON
+        with pytest.raises(InvalidSelectValueError):
+            season.value = UNPLAYED_SEASON
+
+
+@piloted
+async def test_the_start_sit_week_filter_ends_at_the_last_week_of_results(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """A season part-way through offers its played weeks, not its scheduled ones."""
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"].filter(pl.col("week") <= WEEKS_PLAYED),
+        fixture_frames["load_schedules"],
+        fixture_frames,
+    )
+    view = start_sit_screen.StartSitView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        week = view.query_one("#ss-filter-week", Select)
+
+        assert week.value == WEEKS_PLAYED
+        with pytest.raises(InvalidSelectValueError):
+            week.value = WEEKS_PLAYED + 1
+
+
+@piloted
+async def test_start_sit_says_so_when_no_season_carries_a_completed_week(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"].clear(),
+        fixture_frames["load_schedules"],
+        fixture_frames,
+    )
+    view = start_sit_screen.StartSitView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert view.query_one("#ss-table", DataTable).row_count == 0
+        assert str(view.query_one("#ss-table-empty", Static).visual) == start_sit_screen.NO_RESULTS
+
+
+@piloted
+async def test_trade_value_says_so_when_no_season_reaches_the_week_a_ranking_rests_on(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """A season fewer weeks deep than the floor ranks nobody, and the table says why."""
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"].filter(
+            pl.col("week") < trade_value_screen.MIN_WEEKS_PLAYED
+        ),
+        fixture_frames["load_schedules"],
+        fixture_frames,
+    )
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert view.query_one("#tv-table", DataTable).row_count == 0
+        assert (
+            str(view.query_one("#tv-table-empty", Static).visual)
+            == trade_value_screen.NO_RANKABLE_WEEKS
+        )
