@@ -15,16 +15,16 @@ def _rz_plays(pbp: pl.DataFrame) -> pl.DataFrame:
 def compute_team_rz(pbp: pl.DataFrame) -> pl.DataFrame:
     """Team-level red zone stats per season.
 
-    Returns: team, season, rz_trips, rz_tds, conv_pct, pass_pct, rush_pct, rz_epa.
+    Returns: team, season, rz_trips, rz_tds, conv_pct, pass_pct, rush_pct, rz_epa,
+    ordered by conversion rate. Team and season break a tie, so identical plays
+    give identical row order whatever order the plays arrive in.
     """
     rz = _rz_plays(pbp)
 
     df = (
         rz.group_by("posteam", "season")
         .agg(
-            pl.concat_str(["game_id", "fixed_drive"], separator="_")
-            .n_unique()
-            .alias("rz_trips"),
+            pl.concat_str(["game_id", "fixed_drive"], separator="_").n_unique().alias("rz_trips"),
             pl.col("touchdown").sum().cast(pl.Int32).alias("rz_tds"),
             pl.col("pass_attempt").sum().cast(pl.Int32).alias("rz_passes"),
             pl.col("rush_attempt").sum().cast(pl.Int32).alias("rz_rushes"),
@@ -37,7 +37,18 @@ def compute_team_rz(pbp: pl.DataFrame) -> pl.DataFrame:
             (pl.col("rz_rushes") / pl.col("rz_plays") * 100).alias("rush_pct"),
         )
         .rename({"posteam": "team"})
-        .sort("conv_pct", descending=True)
+        .select(
+            "team",
+            "season",
+            "rz_trips",
+            "rz_tds",
+            "conv_pct",
+            "pass_pct",
+            "rush_pct",
+            "rz_epa",
+        )
+        # Team and season key a row uniquely, so the order is total.
+        .sort(["conv_pct", "team", "season"], descending=[True, False, False])
     )
 
     return df
@@ -59,7 +70,9 @@ def compute_player_rz(
     """Player-level red zone stats per season.
 
     Returns: player, position, team, season, rz_targets, rz_tgt_share,
-    rz_carries, rz_touches, rz_tds, td_pct.
+    rz_carries, rz_touches, rz_tds, td_pct, ordered by touchdowns then touches.
+    Player name, season, team and GSIS id break a tie, so identical plays give
+    identical row order whatever order the plays arrive in.
     """
     rz = _rz_plays(pbp)
     pos_map = _player_position_map(rosters)
@@ -73,17 +86,18 @@ def compute_player_rz(
             pl.len().alias("rz_targets"),
             pl.col("pass_touchdown").sum().cast(pl.Int32).alias("rz_rec_tds"),
         )
-        .rename({
-            "receiver_player_id": "player_id",
-            "receiver_player_name": "player",
-            "posteam": "team",
-        })
+        .rename(
+            {
+                "receiver_player_id": "player_id",
+                "receiver_player_name": "name_from_receiving",
+                "posteam": "team",
+            }
+        )
     )
 
     # Team RZ target totals for target share
-    team_rz_targets = (
-        rz_rec.group_by("team", "season")
-        .agg(pl.col("rz_targets").sum().alias("team_rz_targets"))
+    team_rz_targets = rz_rec.group_by("team", "season").agg(
+        pl.col("rz_targets").sum().alias("team_rz_targets")
     )
     rz_rec = rz_rec.join(team_rz_targets, on=["team", "season"], how="left")
     rz_rec = rz_rec.with_columns(
@@ -99,20 +113,27 @@ def compute_player_rz(
             pl.len().alias("rz_carries"),
             pl.col("rush_touchdown").sum().cast(pl.Int32).alias("rz_rush_tds"),
         )
-        .rename({
-            "rusher_player_id": "player_id",
-            "rusher_player_name": "player",
-            "posteam": "team",
-        })
+        .rename(
+            {
+                "rusher_player_id": "player_id",
+                "rusher_player_name": "name_from_rushing",
+                "posteam": "team",
+            }
+        )
     )
 
     # Merge receiving + rushing
+    # Identity is the player id. The two name columns are display text drawn
+    # from separate source fields, so a player who both catches and runs inside
+    # the twenty can carry two spellings; the halves land on one row and the
+    # receiving spelling wins wherever both sides carry a name.
     df = rz_rec.join(
         rz_rush,
-        on=["player_id", "player", "team", "season"],
+        on=["player_id", "team", "season"],
         how="full",
         coalesce=True,
     ).with_columns(
+        pl.coalesce("name_from_receiving", "name_from_rushing").alias("player"),
         pl.col("rz_targets").fill_null(0),
         pl.col("rz_rec_tds").fill_null(0),
         pl.col("rz_tgt_share").fill_null(0.0),
@@ -125,16 +146,29 @@ def compute_player_rz(
         (pl.col("rz_targets") + pl.col("rz_carries")).alias("rz_touches"),
         (pl.col("rz_rec_tds") + pl.col("rz_rush_tds")).alias("rz_tds"),
     ).with_columns(
-        pl.when(pl.col("rz_touches") > 0)
-        .then(pl.col("rz_tds") / pl.col("rz_touches") * 100)
-        .otherwise(0.0)
-        .alias("td_pct"),
+        # Every row descends from a group_by over red zone targets or carries, so
+        # rz_touches is at least one and the ratio is defined on all of them.
+        (pl.col("rz_tds") / pl.col("rz_touches") * 100).alias("td_pct"),
     )
 
     # Join position from rosters
     df = df.join(pos_map, on="player_id", how="left")
 
-    return df.select(
-        "player", "position", "team", "season",
-        "rz_targets", "rz_tgt_share", "rz_carries", "rz_touches", "rz_tds", "td_pct",
-    ).sort("rz_tds", descending=True)
+    # Player id, team and season key a row uniquely, so the order is total.
+    ordered = df.sort(
+        ["rz_tds", "rz_touches", "player", "season", "team", "player_id"],
+        descending=[True, True, False, False, False, False],
+    )
+
+    return ordered.select(
+        "player",
+        "position",
+        "team",
+        "season",
+        "rz_targets",
+        "rz_tgt_share",
+        "rz_carries",
+        "rz_touches",
+        "rz_tds",
+        "td_pct",
+    )

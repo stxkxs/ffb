@@ -17,24 +17,26 @@ def compute_usage_trends(
 ) -> pl.DataFrame:
     """Compute composite usage scores and trends per player per week.
 
-    Returns: player, position, team, season, week, snap_pct, tgt_share,
-    touch_share, usage_score, rolling_avg, delta, velocity, trend.
+    Returns: gsis_id, player, position, team, season, week, snap_pct,
+    tgt_share, touch_share, usage_score, rolling_avg, delta, velocity, trend.
+
+    Every rolling window groups by ``gsis_id``. Display names collide across
+    the league — multiple active players share a name in any given season —
+    so a name-keyed window splices two players into one series.
     """
     if window < 2:
         raise ValueError(f"window must be >= 2, got {window}")
 
     # ── Snap data ────────────────────────────────────────────
     snap_df = (
-        snaps.filter(
-            pl.col("position").is_in(OFFENSIVE_POSITIONS)
-            & (pl.col("game_type") == "REG")
-        )
+        snaps.filter(pl.col("position").is_in(OFFENSIVE_POSITIONS) & (pl.col("game_type") == "REG"))
         .select("pfr_player_id", "player", "position", "team", "season", "week", "offense_pct")
         .drop_nulls(subset=["offense_pct", "pfr_player_id"])
     )
 
     # Normalize to 0-100
-    if snap_df["offense_pct"].max() is not None and snap_df["offense_pct"].max() <= 1.0:
+    max_pct = snap_df["offense_pct"].max()
+    if isinstance(max_pct, (int, float)) and max_pct <= 1.0:
         snap_df = snap_df.with_columns(pl.col("offense_pct") * 100)
 
     # ── Map pfr_id → gsis_id ────────────────────────────────
@@ -50,9 +52,7 @@ def compute_usage_trends(
             pl.col("targets").fill_null(0),
             pl.col("carries").fill_null(0),
         )
-        .with_columns(
-            (pl.col("targets") + pl.col("carries")).alias("touches")
-        )
+        .with_columns((pl.col("targets") + pl.col("carries")).alias("touches"))
     )
 
     # ── Join snap data with stats ────────────────────────────
@@ -64,12 +64,9 @@ def compute_usage_trends(
     )
 
     # ── Team totals per week (for share calculations) ────────
-    team_totals = (
-        df.group_by("team", "season", "week")
-        .agg(
-            pl.col("targets").sum().alias("team_targets"),
-            pl.col("touches").sum().alias("team_touches"),
-        )
+    team_totals = df.group_by("team", "season", "week").agg(
+        pl.col("targets").sum().alias("team_targets"),
+        pl.col("touches").sum().alias("team_touches"),
     )
 
     df = df.join(team_totals, on=["team", "season", "week"], how="left")
@@ -91,35 +88,31 @@ def compute_usage_trends(
     # ── Composite usage score ────────────────────────────────
     df = df.with_columns(
         (
-            pl.col("snap_pct") * 0.4
-            + pl.col("tgt_share") * 0.35
-            + pl.col("touch_share") * 0.25
+            pl.col("snap_pct") * 0.4 + pl.col("tgt_share") * 0.35 + pl.col("touch_share") * 0.25
         ).alias("usage_score")
     )
 
     # ── Trend computation (same pattern as snap_share) ───────
-    df = df.sort("player", "season", "week")
+    df = df.sort("gsis_id", "season", "week")
 
     # Rolling average of previous weeks
     df = df.with_columns(
         pl.col("usage_score")
         .shift(1)
         .rolling_mean(window_size=window, min_samples=1)
-        .over("player", "season")
+        .over("gsis_id", "season")
         .alias("rolling_avg")
     )
 
     # Delta
-    df = df.with_columns(
-        (pl.col("usage_score") - pl.col("rolling_avg")).alias("delta")
-    )
+    df = df.with_columns((pl.col("usage_score") - pl.col("rolling_avg")).alias("delta"))
 
     # Velocity (slope)
     df = df.with_columns(
         (
             (
                 pl.col("usage_score")
-                - pl.col("usage_score").shift(window - 1).over("player", "season")
+                - pl.col("usage_score").shift(window - 1).over("gsis_id", "season")
             )
             / (window - 1)
         ).alias("velocity")
@@ -136,11 +129,19 @@ def compute_usage_trends(
     )
 
     # Drop incomplete rows and select output columns
-    return (
-        df.drop_nulls(subset=["rolling_avg", "velocity"])
-        .select(
-            "player", "position", "team", "season", "week",
-            "snap_pct", "tgt_share", "touch_share", "usage_score",
-            "rolling_avg", "delta", "velocity", "trend",
-        )
+    return df.drop_nulls(subset=["rolling_avg", "velocity"]).select(
+        "gsis_id",
+        "player",
+        "position",
+        "team",
+        "season",
+        "week",
+        "snap_pct",
+        "tgt_share",
+        "touch_share",
+        "usage_score",
+        "rolling_avg",
+        "delta",
+        "velocity",
+        "trend",
     )
