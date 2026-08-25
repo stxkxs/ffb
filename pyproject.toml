@@ -26,6 +26,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.uv]
@@ -42,7 +43,40 @@ ignore = ["SIM117"]  # nested with statements are idiomatic in Textual compose()
 
 [tool.mypy]
 python_version = "3.12"
-strict = false
-warn_unused_imports = true
-warn_return_any = true
-disallow_untyped_defs = false
+strict = true
+disallow_any_unimported = true
+disallow_redefinition_new = true
+disallow_untyped_globals = true
+local_partial_types = true
+strict_bytes = true
+warn_unreachable = true
+enable_error_code = [
+    "deprecated",
+    "exhaustive-match",
+    "ignore-without-code",
+    "narrowed-type-not-subtype",
+    "possibly-undefined",
+    "redundant-expr",
+    "redundant-self",
+    "truthy-bool",
+    "truthy-iterable",
+    "unimported-reveal",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--showlocals"]
+
+[tool.coverage.run]
+source = ["src/ffb"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# Floor set from the measured total. `uv run pytest --cov` enforces it; a plain
+# `uv run pytest` collects no coverage and so does not.
+fail_under = 86
+exclude_also = [
+    "raise NotImplementedError",
+]

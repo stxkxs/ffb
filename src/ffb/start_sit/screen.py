@@ -2,118 +2,119 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import polars as pl
-from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widget import Widget
-from textual.widgets import (
-    Button,
-    DataTable,
-    LoadingIndicator,
-    Select,
-)
+from textual.widgets import DataTable, Select
 
 from ffb.data.loader import load_schedules, load_weekly_stats
+from ffb.data.seasons import recent_seasons
 from ffb.start_sit.engine import compute_start_sit
+from ffb.ui.base import ALL, ToolView
 
+#: Table headers, in the order `_projection_row` emits cells.
 COLUMNS = (
-    "Player", "Pos", "Team", "Opp",
-    "Baseline", "Opp Allows", "Lg Avg",
-    "Mult", "Projected", "Verdict",
+    "Player",
+    "Pos",
+    "Team",
+    "Opp",
+    "Baseline",
+    "Opp Allows",
+    "Lg Avg",
+    "Mult",
+    "Projected",
+    "Verdict",
+)
+
+#: Seasons loaded. The season filter offers one entry per loaded season, so this
+#: window sets how far back a lineup decision can be reviewed.
+SEASON_WINDOW = 2
+
+#: Stands in for the table when the engine projects nobody for the selected week.
+NO_PROJECTIONS = (
+    "No projections for this week. A matchup multiplier needs three completed weeks "
+    "of defensive results behind it, so week 4 is the earliest week that projects."
+)
+
+#: Stands in for the table when projections exist but the filters exclude all of them.
+NO_MATCHES = (
+    "No players match the position and team filters. "
+    "Widen either filter to see this week's projections."
 )
 
 
-class StartSitView(Widget):
-    """Matchup-based start/sit projection engine."""
+@dataclass(frozen=True)
+class StartSitData:
+    """The two frames every projection in this view is computed from."""
 
-    DEFAULT_CSS = """
-    StartSitView {
-        height: 1fr;
-        width: 1fr;
-    }
+    weekly_stats: pl.DataFrame
+    schedules: pl.DataFrame
 
-    #ss-loading {
-        height: 1fr;
-    }
 
-    #ss-content {
-        height: 1fr;
-    }
+def _projection_row(row: dict[str, Any]) -> tuple[str, ...]:
+    """Format one projection as table cells, in COLUMNS order.
 
-    .filter-bar {
-        height: auto;
-        max-height: 5;
-        padding: 1;
-        background: $surface-darken-1;
-    }
-
-    .filter-bar Select {
-        width: 1fr;
-        margin-right: 1;
-    }
-
-    .filter-bar #ss-btn-refresh {
-        margin-left: 1;
-    }
+    An em dash stands in for an absent points-allowed average, league average or
+    multiplier, so a missing defensive sample reads as missing rather than as zero.
     """
+    return (
+        row["player"],
+        row["position"],
+        row["team"],
+        row["opponent"],
+        f"{row['baseline_fpts']:.1f}",
+        f"{row['fpts_allowed']:.1f}" if row["fpts_allowed"] is not None else "—",
+        f"{row['league_avg']:.1f}" if row["league_avg"] is not None else "—",
+        f"{row['matchup_mult']:.2f}x" if row["matchup_mult"] is not None else "—",
+        f"{row['projected_fpts']:.1f}",
+        row["confidence"],
+    )
 
-    def __init__(self, **kwargs) -> None:
+
+class StartSitView(ToolView):
+    """Matchup-adjusted start/sit projections for one week."""
+
+    ID_PREFIX = "ss"
+    LOAD_LABEL = "Loading weekly stats and schedules"
+
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._weekly_stats: pl.DataFrame | None = None
         self._schedules: pl.DataFrame | None = None
         self._projections: pl.DataFrame | None = None
-        self._activated = False
-        self._initializing = True
 
-    def compose(self) -> ComposeResult:
-        yield LoadingIndicator(id="ss-loading")
-        with Vertical(id="ss-content"):
-            with Horizontal(classes="filter-bar"):
-                yield Select[str](
-                    [("All", "All"), ("QB", "QB"), ("RB", "RB"), ("WR", "WR"), ("TE", "TE")],
-                    value="All",
-                    id="ss-filter-position",
-                )
-                yield Select[str]([], prompt="Team", id="ss-filter-team")
-                yield Select[int]([], prompt="Season", id="ss-filter-season")
-                yield Select[int]([], prompt="Week", id="ss-filter-week")
-                yield Button("Refresh", id="ss-btn-refresh", variant="primary")
-            yield DataTable(id="ss-table")
+    def compose_content(self) -> ComposeResult:
+        yield from self.compose_filter_bar(
+            self.position_select(),
+            Select[str]([], prompt="Team", id="ss-filter-team"),
+            Select[int]([], prompt="Season", id="ss-filter-season"),
+            Select[int]([], prompt="Week", id="ss-filter-week"),
+        )
+        yield DataTable(id="ss-table")
 
     def on_mount(self) -> None:
-        self.query_one("#ss-content").display = False
+        # Textual dispatches every on_mount along the MRO, so the base class hides the
+        # panes and pairs the table with its empty-state label without a super() call.
         table = self.query_one("#ss-table", DataTable)
         table.add_columns(*COLUMNS)
         table.cursor_type = "row"
 
-    def activate(self) -> None:
-        if not self._activated:
-            self._activated = True
-            self._fetch_data()
+    # ── load ─────────────────────────────────────────────────
 
-    @work(thread=True, exclusive=True)
-    def _fetch_data(self, force_refresh: bool = False) -> None:
-        try:
-            weekly = load_weekly_stats([2024, 2025], force_refresh=force_refresh)
-            schedules = load_schedules([2024, 2025], force_refresh=force_refresh)
-            self.app.call_from_thread(self._on_data_loaded, weekly, schedules)
-        except Exception as e:
-            self.app.call_from_thread(self._on_data_error, str(e))
+    def fetch(self, force_refresh: bool) -> StartSitData:
+        seasons = recent_seasons(SEASON_WINDOW)
+        return StartSitData(
+            weekly_stats=load_weekly_stats(seasons, force_refresh=force_refresh),
+            schedules=load_schedules(seasons, force_refresh=force_refresh),
+        )
 
-    def _on_data_loaded(self, weekly: pl.DataFrame, schedules: pl.DataFrame) -> None:
-        self._weekly_stats = weekly
-        self._schedules = schedules
-        self._initializing = True
+    def apply(self, payload: StartSitData) -> None:
+        self._weekly_stats = payload.weekly_stats
+        self._schedules = payload.schedules
         self._populate_filters()
-        self._initializing = False
         self._compute_projections()
-        self.query_one("#ss-loading").display = False
-        self.query_one("#ss-content").display = True
-
-    def _on_data_error(self, error: str) -> None:
-        self.query_one("#ss-loading").display = False
-        self.notify(f"Failed to load data: {error}", severity="error", timeout=10)
 
     # ── filters ──────────────────────────────────────────────
 
@@ -126,101 +127,89 @@ class StartSitView(Widget):
         seasons = sorted(reg["season"].unique().drop_nulls().to_list())
         season_select = self.query_one("#ss-filter-season", Select)
         season_select.set_options([(str(s), s) for s in seasons])
-        season_select.value = seasons[-1]
+        if seasons:
+            season_select.value = seasons[-1]
 
         self._update_week_and_team_options()
 
     def _update_week_and_team_options(self) -> None:
         if self._schedules is None:
             return
-        season = self.query_one("#ss-filter-season", Select).value
-        if season is Select.BLANK:
+        season = self.selected("ss-filter-season")
+        if season is None:
             return
 
-        reg = self._schedules.filter(
-            (pl.col("season") == season) & (pl.col("game_type") == "REG")
-        )
+        reg = self._schedules.filter((pl.col("season") == season) & (pl.col("game_type") == "REG"))
 
         weeks = sorted(reg["week"].unique().drop_nulls().to_list())
         week_select = self.query_one("#ss-filter-week", Select)
         week_select.set_options([(f"Week {w}", w) for w in weeks])
-        # Default to latest week with games
-        week_select.value = weeks[-1] if weeks else Select.BLANK
+        # The week with the most recent results is the one a lineup decision is about.
+        if weeks:
+            week_select.value = weeks[-1]
 
         teams = sorted(
             set(reg["home_team"].unique().drop_nulls().to_list())
             | set(reg["away_team"].unique().drop_nulls().to_list())
         )
         team_select = self.query_one("#ss-filter-team", Select)
-        team_select.set_options([("All", "All")] + [(t, t) for t in teams])
-        team_select.value = "All"
+        team_select.set_options(self.all_options(teams))
+        team_select.value = ALL
 
     def _compute_projections(self) -> None:
+        """Re-run the engine for the selected season and week.
+
+        Projections are a function of the week, not of the position and team filters,
+        so a season or week change recomputes rather than re-filtering.
+        """
         if self._weekly_stats is None or self._schedules is None:
             return
 
-        season = self.query_one("#ss-filter-season", Select).value
-        week = self.query_one("#ss-filter-week", Select).value
-        if season is Select.BLANK or week is Select.BLANK:
+        season = self.selected("ss-filter-season")
+        week = self.selected("ss-filter-week")
+        # Both selects carry the season and week integers taken from the schedule until
+        # a load fills their options, and a filter holding no selection projects nothing.
+        if not isinstance(season, int) or not isinstance(week, int):
             return
 
-        proj = compute_start_sit(self._weekly_stats, self._schedules, int(season), int(week))
-        self._projections = proj
+        self._projections = compute_start_sit(self._weekly_stats, self._schedules, season, week)
         self._apply_filters()
 
     def _apply_filters(self) -> None:
-        if self._projections is None:
+        df = self._projections
+        if df is None:
             return
 
-        df = self._projections
+        # Filter expressions name columns, and a result with no rows is not required to
+        # declare any. Routing an empty result straight to the table keeps this view
+        # correct whatever shape the engine gives an empty frame, and filtering zero
+        # rows could only ever yield zero rows.
+        if df.height == 0:
+            self.fill_table("ss-table", df, _projection_row, NO_PROJECTIONS)
+            return
 
-        pos = self.query_one("#ss-filter-position", Select).value
-        if pos not in ("All", Select.BLANK):
+        pos = self.narrowing("ss-filter-position")
+        if pos is not None:
             df = df.filter(pl.col("position") == pos)
 
-        team = self.query_one("#ss-filter-team", Select).value
-        if team not in ("All", Select.BLANK):
+        team = self.narrowing("ss-filter-team")
+        if team is not None:
             df = df.filter(pl.col("team") == team)
 
-        self._fill_table(df)
-
-    # ── table ────────────────────────────────────────────────
-
-    def _fill_table(self, df: pl.DataFrame) -> None:
-        table = self.query_one("#ss-table", DataTable)
-        table.clear()
-        for row in df.iter_rows(named=True):
-            table.add_row(
-                row["player"],
-                row["position"],
-                row["team"],
-                row["opponent"],
-                f"{row['baseline_fpts']:.1f}",
-                f"{row['fpts_allowed']:.1f}" if row["fpts_allowed"] is not None else "—",
-                f"{row['league_avg']:.1f}" if row["league_avg"] is not None else "—",
-                f"{row['matchup_mult']:.2f}x" if row["matchup_mult"] is not None else "—",
-                f"{row['projected_fpts']:.1f}",
-                row["confidence"],
-            )
+        self.fill_table("ss-table", df, _projection_row, NO_MATCHES)
 
     # ── events ───────────────────────────────────────────────
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if self._initializing:
-            return
-        if event.select.id == "ss-filter-season":
-            self._initializing = True
+    def filter_changed(self, filter_id: str | None) -> None:
+        """Project again for a season or week change; re-filter for the rest.
+
+        A season change rebuilds the week and team options, which reaches the engine
+        through the week the rebuild selects.
+        """
+        if filter_id == "ss-filter-season":
             self._update_week_and_team_options()
-            self._initializing = False
             self._compute_projections()
-        elif event.select.id == "ss-filter-week":
+        elif filter_id == "ss-filter-week":
             self._compute_projections()
         else:
             self._apply_filters()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "ss-btn-refresh":
-            self.query_one("#ss-content").display = False
-            self.query_one("#ss-loading").display = True
-            self._activated = False
-            self.activate()
