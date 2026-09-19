@@ -7,7 +7,9 @@ seam every loader fetches through, and the download tests pass their own callabl
 
 import email.message
 import json
+import sys
 import threading
+import types
 import urllib.error
 from collections.abc import Callable
 from typing import Any
@@ -26,21 +28,24 @@ class FakeNflverse:
     a frame to return, or a callable taking the arguments the loader passes. An
     importer with no keyword raises `KeyError`, so a loader reaching for data the
     test did not describe fails loudly.
+
+    A call records its keyword arguments alongside its positional ones, so a test can
+    assert the options a loader sends an importer and not only the season it asks for.
     """
 
     def __init__(self, **importers: Any) -> None:
         self.importers = importers
-        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
-    def __call__(self, importer: str, *args: Any) -> pl.DataFrame:
-        self.calls.append((importer, args))
+    def __call__(self, importer: str, *args: Any, **options: Any) -> pl.DataFrame:
+        self.calls.append((importer, args, options))
         handler = self.importers[importer]
         return handler(*args) if callable(handler) else handler
 
     @property
     def names(self) -> list[str]:
         """The importers called, in call order."""
-        return [name for name, _ in self.calls]
+        return [name for name, _, _ in self.calls]
 
 
 def marked(marker: int) -> pl.DataFrame:
@@ -125,7 +130,7 @@ def stall():
 def test_a_miss_fetches_from_the_importer_the_loader_names(nflverse):
     fake = nflverse(import_snap_counts=marked(1))
     loader.load_snap_counts([2025])
-    assert fake.calls == [("import_snap_counts", ([2025],))]
+    assert fake.calls == [("import_snap_counts", ([2025],), {})]
 
 
 def test_a_fresh_entry_is_served_without_a_second_fetch(nflverse):
@@ -201,7 +206,7 @@ def test_distinct_seasons_of_one_dataset_hold_separate_entries(nflverse):
 def test_the_player_crosswalk_is_fetched_without_seasons(nflverse):
     fake = nflverse(import_ids=marked(1))
     loader.load_player_ids()
-    assert fake.calls == [("import_ids", ())]
+    assert fake.calls == [("import_ids", (), {})]
 
 
 def test_the_player_crosswalk_is_stored_under_a_key_naming_no_seasons(nflverse, cache_dir):
@@ -306,7 +311,7 @@ def test_only_the_unpublished_seasons_reach_the_fallback(nflverse, pbp, rosters)
     )
     loader.load_weekly_stats([2024, 2025])
     assert [call for call in fake.calls if call[0] == "import_pbp_data"] == [
-        ("import_pbp_data", ([2025],))
+        ("import_pbp_data", ([2025],), {"include_participation": False})
     ]
 
 
@@ -550,7 +555,7 @@ def test_a_loader_taking_a_season_list_raises_when_the_source_holds_none_of_them
     nflverse, name, importer
 ):
     nflverse(**{importer: source()})
-    with pytest.raises(RuntimeError, match="nflverse has not published"):
+    with pytest.raises(RuntimeError, match="obtained for"):
         getattr(loader, name)([2026])
 
 
@@ -563,8 +568,61 @@ def test_each_season_is_asked_for_in_its_own_request(nflverse):
     fake = nflverse(import_snap_counts=source(2025, 2026))
     loader.load_snap_counts([2026, 2025])
     assert fake.calls == [
-        ("import_snap_counts", ([2025],)),
-        ("import_snap_counts", ([2026],)),
+        ("import_snap_counts", ([2025],), {}),
+        ("import_snap_counts", ([2026],), {}),
+    ]
+
+
+def test_the_participation_option_reaches_nfl_data_py(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The binding is exercised where every other test replaces the function that does it.
+
+    `FakeNflverse` stands in for `loader._nflverse`, so an assertion made through it
+    observes the arguments the loader passed rather than the arguments nf_data_py
+    received. Dropping the binding would leave those assertions passing.
+    """
+    import pandas
+
+    received: dict[str, Any] = {}
+
+    def import_pbp_data(seasons: list[int], **options: Any) -> "pandas.DataFrame":
+        received["seasons"] = seasons
+        received["options"] = options
+        return pandas.DataFrame({"season": seasons})
+
+    module = types.ModuleType("nfl_data_py")
+    module.import_pbp_data = import_pbp_data  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nfl_data_py", module)
+
+    loader._nflverse_pbp(2025)
+
+    assert received == {"seasons": [2025], "options": {"include_participation": False}}
+
+
+def test_play_by_play_is_asked_for_without_the_participation_sidecar(nflverse):
+    """The sidecar is a separate release asset a season can lack while holding play-by-play.
+
+    `import_pbp_data` reads both under one `try`, so requesting the sidecar makes its
+    absence discard the play-by-play beside it.
+    """
+    fake = nflverse(import_pbp_data=source(2025))
+    loader.load_pbp([2025])
+    assert fake.calls == [("import_pbp_data", ([2025],), {"include_participation": False})]
+
+
+def test_the_weekly_fallback_asks_for_play_by_play_without_the_sidecar(nflverse, pbp, rosters):
+    """The derivation reaches play-by-play under the same terms the direct loader does.
+
+    nflverse publishes weekly stats per season after the fact, so a season in progress
+    reaches this path rather than the published asset.
+    """
+    fake = nflverse(
+        import_weekly_data=unavailable,
+        import_pbp_data=pbp,
+        import_seasonal_rosters=rosters,
+    )
+    loader.load_weekly_stats([2025])
+    assert [call for call in fake.calls if call[0] == "import_pbp_data"] == [
+        ("import_pbp_data", ([2025],), {"include_participation": False})
     ]
 
 
@@ -585,9 +643,15 @@ def test_a_request_holding_no_published_season_names_the_seasons(nflverse):
         loader.load_snap_counts([2025, 2026])
 
 
-def test_a_request_holding_no_published_season_names_the_source(nflverse):
+def test_a_request_holding_no_published_season_blames_no_cause(nflverse):
+    """A dropped season names what was not obtained, not why.
+
+    A season drops on a missing release asset and on a failed transfer alike, and the
+    loader cannot tell the two apart. Naming nflverse in the message would send a
+    reader to wait on a publication that may already have happened.
+    """
     nflverse(import_snap_counts=source())
-    with pytest.raises(RuntimeError, match="nflverse has not published"):
+    with pytest.raises(RuntimeError, match="^No snap counts obtained for seasons 2025, 2026$"):
         loader.load_snap_counts([2025, 2026])
 
 
@@ -653,9 +717,9 @@ def test_a_season_stored_by_a_partial_load_is_served_from_the_cache(nflverse):
     loader.load_snap_counts([2025, 2026])
     loader.load_snap_counts([2025, 2026])
     assert fake.calls == [
-        ("import_snap_counts", ([2025],)),
-        ("import_snap_counts", ([2026],)),
-        ("import_snap_counts", ([2026],)),
+        ("import_snap_counts", ([2025],), {}),
+        ("import_snap_counts", ([2026],), {}),
+        ("import_snap_counts", ([2026],), {}),
     ]
 
 
@@ -687,7 +751,7 @@ def test_weekly_stats_covered_by_neither_asset_in_any_season_raise(nflverse):
         import_pbp_data=source(absent=undefined_name),
         import_seasonal_rosters=source(),
     )
-    with pytest.raises(RuntimeError, match="nflverse has not published"):
+    with pytest.raises(RuntimeError, match="obtained for"):
         loader.load_weekly_stats([2025, 2026])
 
 

@@ -148,32 +148,39 @@ only those opens from disk. Retrying the tool that timed out means pressing **Re
 which forces every dataset it loads — including the ones already cached — to download
 again.
 
-**A season nflverse has not published.** The season label rolls over on 1 September,
-while nflverse publishes a season's play-by-play, snap counts, weekly stats and injuries
-only once its games have been played — so for the opening days of September every tool asks
-for a season the source answers `HTTP Error 404` for. That season contributes no rows and
-the seasons beside it render: each loader resolves its season list one season at a time, so
-an unpublished season costs only itself.
+**A season a load does not obtain.** The season label rolls over on 1 September, while
+nflverse publishes a season's play-by-play, snap counts, weekly stats and injuries only
+once its games have been played — so for the opening days of September every tool asks for
+a season the source answers `HTTP Error 404` for. That season contributes no rows and the
+seasons beside it render: each loader resolves its season list one season at a time, so a
+season that does not resolve costs only itself.
 
-The skip reaches the interface, because every screen builds its season filter from the
-seasons its data carries rows for. The unpublished season is absent from the
-filter, and the filter opens on the newest season that has data. Start/Sit and Trade Value
-read their season options off the results for the same reason, not off the schedule:
-nflverse publishes a schedule months before the season opens, so a schedule alone would
-offer a season nothing can be projected or ranked for.
+A transport failure costs the same season the same way, and reaches the loaders as the same
+exception. Nothing below the loaders distinguishes the two, so nothing reports which one
+happened; a season that disappears on one load and returns on the next was a failed
+transfer, and one that stays absent is waiting on the source.
 
-Nothing negative is cached, so the season joins the filter on the first load after nflverse
-publishes it. The price is one failed request per unpublished asset per load.
+The drop reaches the interface, because every screen builds its season filter from the
+seasons its data carries rows for. The absent season is absent from the filter, and the
+filter opens on the newest season that has data. Start/Sit reads its week options off the
+results for the same reason, not off the schedule: nflverse publishes a schedule months
+before the season opens, so a schedule alone would offer a week nothing can be projected
+for. Trade Value offers a season as soon as one of its weeks has been played, which is
+earlier than it can rank one — the season being played is the season a trade is made in,
+and the chart says what it is still short of rather than falling back to a finished season.
 
-**`Failed to load data: nflverse has not published snap counts for season 2026`.** Every
-season the tool asked for is unpublished, so the load has nothing to render. The message
-names the dataset and the seasons. Loads whose datasets are published are unaffected: a tool
-fails only on the dataset it could not resolve at all.
+Nothing negative is cached, so the season joins the filter on the first load that obtains
+it. The price is one failed request per absent asset per load.
+
+**`Failed to load data: No snap counts obtained for season 2026`.** Every season the tool
+asked for dropped, so the load has nothing to render. The message names the dataset and the
+seasons, and no cause. Loads whose datasets resolve are unaffected: a tool fails only on the
+dataset it could not resolve at all.
 
 **Any other `Failed to load data:` toast** carries the message the download itself raised. A
-season nflverse has not published a weekly-stats asset for is not an error on its own: those
-weeks are derived from play-by-play, at the cost of a play-by-play download, and the season
-drops out only when neither asset covers it.
+season with no weekly-stats asset is not an error on its own: those weeks are derived from
+play-by-play, at the cost of a play-by-play download, and the season drops out only when
+neither asset covers it.
 
 **A table shows a sentence where rows would be.** An empty result renders as a message
 naming which emptiness it is — a filter combination that matches nothing, a season and week

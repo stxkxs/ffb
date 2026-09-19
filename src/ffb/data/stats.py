@@ -28,29 +28,27 @@ def compute_weekly_stats_from_pbp(
     plays = pbp.filter(pl.col("play_type").is_in(["pass", "run"]))
 
     # ── Receiving stats ──────────────────────────────────────
+    # The name is taken off the group rather than grouped on. nflverse spells a name
+    # from the source field of each play, so one id can carry two spellings inside a
+    # single role in one week; grouping on the spelling would split that week into two
+    # partial lines. The spelling kept is the one the week's first play carries.
     rec = (
         plays.filter((pl.col("pass_attempt") == 1) & pl.col("receiver_player_id").is_not_null())
         .group_by(
             "receiver_player_id",
-            "receiver_player_name",
             "posteam",
             "season",
             "week",
             "season_type",
         )
         .agg(
+            pl.col("receiver_player_name").first().alias("name_from_receiving"),
             pl.len().alias("targets"),
             pl.col("complete_pass").sum().alias("receptions"),
             pl.col("receiving_yards").sum().alias("receiving_yards"),
             pl.col("pass_touchdown").sum().alias("receiving_tds"),
         )
-        .rename(
-            {
-                "receiver_player_id": "player_id",
-                "receiver_player_name": "name_from_receiving",
-                "posteam": "recent_team",
-            }
-        )
+        .rename({"receiver_player_id": "player_id", "posteam": "recent_team"})
     )
 
     # ── Rushing stats ────────────────────────────────────────
@@ -58,24 +56,18 @@ def compute_weekly_stats_from_pbp(
         plays.filter((pl.col("rush_attempt") == 1) & pl.col("rusher_player_id").is_not_null())
         .group_by(
             "rusher_player_id",
-            "rusher_player_name",
             "posteam",
             "season",
             "week",
             "season_type",
         )
         .agg(
+            pl.col("rusher_player_name").first().alias("name_from_rushing"),
             pl.len().alias("carries"),
             pl.col("rushing_yards").sum().alias("rushing_yards"),
             pl.col("rush_touchdown").sum().alias("rushing_tds"),
         )
-        .rename(
-            {
-                "rusher_player_id": "player_id",
-                "rusher_player_name": "name_from_rushing",
-                "posteam": "recent_team",
-            }
-        )
+        .rename({"rusher_player_id": "player_id", "posteam": "recent_team"})
     )
 
     # ── Passing stats ────────────────────────────────────────
@@ -83,47 +75,44 @@ def compute_weekly_stats_from_pbp(
         plays.filter((pl.col("pass_attempt") == 1) & pl.col("passer_player_id").is_not_null())
         .group_by(
             "passer_player_id",
-            "passer_player_name",
             "posteam",
             "season",
             "week",
             "season_type",
         )
         .agg(
+            pl.col("passer_player_name").first().alias("name_from_passing"),
             pl.col("passing_yards").sum().alias("passing_yards"),
             pl.col("pass_touchdown").sum().alias("passing_tds"),
             pl.col("interception").sum().alias("interceptions"),
         )
-        .rename(
-            {
-                "passer_player_id": "player_id",
-                "passer_player_name": "name_from_passing",
-                "posteam": "recent_team",
-            }
-        )
+        .rename({"passer_player_id": "player_id", "posteam": "recent_team"})
     )
 
     # ── Fumbles (attributed to the fumbler) ──────────────────
     # Read from the unfiltered frame: a fumble lost on a kickoff or punt return
     # carries the same -2 as one lost from scrimmage.
+    # The team is the fumbler's own, which on a return is the team without the ball:
+    # `posteam` names the kicking team there, and attributing the fumble to it would
+    # give the returner a second weekly row under a team they never played for.
     fumbles = (
-        pbp.filter((pl.col("fumble_lost") == 1) & pl.col("fumbled_1_player_id").is_not_null())
+        pbp.filter(
+            (pl.col("fumble_lost") == 1)
+            & pl.col("fumbled_1_player_id").is_not_null()
+            & pl.col("fumbled_1_team").is_not_null()
+        )
         .group_by(
             "fumbled_1_player_id",
-            "fumbled_1_player_name",
-            "posteam",
+            "fumbled_1_team",
             "season",
             "week",
             "season_type",
         )
-        .agg(pl.col("fumble_lost").sum().alias("fumbles_lost"))
-        .rename(
-            {
-                "fumbled_1_player_id": "player_id",
-                "fumbled_1_player_name": "name_from_fumbles",
-                "posteam": "recent_team",
-            }
+        .agg(
+            pl.col("fumbled_1_player_name").first().alias("name_from_fumbles"),
+            pl.col("fumble_lost").sum().alias("fumbles_lost"),
         )
+        .rename({"fumbled_1_player_id": "player_id", "fumbled_1_team": "recent_team"})
     )
 
     # ── Opponent mapping (one defteam per team per game) ────

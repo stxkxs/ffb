@@ -30,7 +30,11 @@ TABLE_IDS = ("sn-rising-table", "sn-falling-table", "sn-all-table")
 
 
 def _trend_row(row: dict[str, Any]) -> tuple[str, ...]:
-    """Format one trend row as table cells, rendering an absent measure as an em dash."""
+    """Format one trend row as table cells, rendering an absent measure as an em dash.
+
+    A season's opening week has no earlier week behind it, so every measure of movement
+    is absent there and the row carries its snap share alone.
+    """
     snap = row["snap_pct"]
     avg = row["rolling_avg"]
     delta = row["delta"]
@@ -44,7 +48,7 @@ def _trend_row(row: dict[str, Any]) -> tuple[str, ...]:
         f"{avg:.1f}%" if avg is not None else "—",
         f"{delta:+.1f}" if delta is not None else "—",
         f"{velocity:+.1f}" if velocity is not None else "—",
-        row["trend"],
+        row["trend"] or "—",
     )
 
 
@@ -183,7 +187,7 @@ class SnapShareView(ToolView):
 
         self.fill_table(
             "sn-all-table",
-            df.sort("delta", descending=True),
+            df.sort("delta", descending=True, nulls_last=True),
             _trend_row,
             "No snap counts for the selected season, week, position and team.",
         )
