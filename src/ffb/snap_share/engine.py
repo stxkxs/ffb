@@ -15,6 +15,13 @@ def compute_trends(
     Returns a DataFrame with columns: pfr_player_id, player, position, team,
     season, week, snap_pct, rolling_avg, delta, velocity, trend.
 
+    Every week a player has a snap share for is a row, including the weeks that open
+    a season. A trend needs earlier weeks to measure against, so the opening week of
+    a player's season carries a snap share and a null rolling average, delta,
+    velocity and trend; the weeks after it slope against the earliest week still inside
+    the window, per week elapsed. A week whose player was absent for longer than the
+    window carries no velocity and no trend either: there is no recent series under it.
+
     Every rolling window groups by ``pfr_player_id``. Display names collide
     across the league — multiple active players share a name in any given
     season — so a name-keyed window splices two players into one series.
@@ -50,25 +57,46 @@ def compute_trends(
     # Delta: current week vs prior rolling average
     df = df.with_columns((pl.col("snap_pct") - pl.col("rolling_avg")).alias("delta"))
 
-    # Velocity: simplified OLS slope = (current - lag(window-1)) / (window-1)
+    # `shift` counts a player's appearances, not weeks, so a lag reaches a week whose
+    # distance depends on which weeks the player was active. Each candidate lag is
+    # admitted only where the weeks it spans fall inside the window, and the slope
+    # divides by those weeks: a player back from an absence longer than the window has
+    # no series to slope across, and one back from a shorter absence slopes across the
+    # weeks that passed rather than the rows.
+    lags = range(window - 1, 0, -1)
+
+    def earlier(lag: int) -> pl.Expr:
+        return pl.col("snap_pct").shift(lag).over("pfr_player_id", "season")
+
+    def span(lag: int) -> pl.Expr:
+        return pl.col("week") - pl.col("week").shift(lag).over("pfr_player_id", "season")
+
+    def inside(lag: int) -> pl.Expr:
+        return (span(lag) > 0) & (span(lag) <= window - 1)
+
+    # Velocity: simplified OLS slope = (current - earlier) / weeks between them, taken
+    # across the widest span the window holds.
     df = df.with_columns(
-        (
-            (
-                pl.col("snap_pct")
-                - pl.col("snap_pct").shift(window - 1).over("pfr_player_id", "season")
-            )
-            / (window - 1)
+        pl.coalesce(
+            [
+                pl.when(inside(lag)).then((pl.col("snap_pct") - earlier(lag)) / span(lag))
+                for lag in lags
+            ]
         ).alias("velocity")
     )
 
-    # Breakout: crossed from <50% to >60% within the window
-    breakout = (pl.col("snap_pct") > 60) & (
-        pl.col("snap_pct").shift(window - 1).over("pfr_player_id", "season") < 50
-    )
+    # The share the window opens on, against which a breakout is measured.
+    opening = pl.coalesce([pl.when(inside(lag)).then(earlier(lag)) for lag in lags])
 
-    # Classify trend
+    # Breakout: crossed from <50% to >60% within the window
+    breakout = (pl.col("snap_pct") > 60) & (opening < 50)
+
+    # Classify trend. A week with nothing behind it has no direction to name, and a
+    # null says so where any label would assert movement that was never measured.
     df = df.with_columns(
-        pl.when(breakout)
+        pl.when(pl.col("velocity").is_null())
+        .then(pl.lit(None, dtype=pl.String))
+        .when(breakout)
         .then(pl.lit("breakout"))
         .when((pl.col("delta") > delta_threshold) & (pl.col("velocity") > 0))
         .then(pl.lit("rising"))
@@ -78,5 +106,4 @@ def compute_trends(
         .alias("trend")
     )
 
-    # Drop weeks without enough history for trend calculation
-    return df.drop_nulls(subset=["rolling_avg", "velocity"])
+    return df

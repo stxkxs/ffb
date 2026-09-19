@@ -20,6 +20,13 @@ def compute_usage_trends(
     Returns: gsis_id, player, position, team, season, week, snap_pct,
     tgt_share, touch_share, usage_score, rolling_avg, delta, velocity, trend.
 
+    Every week a player has usage for is a row, including the weeks that open a
+    season. A trend needs earlier weeks to measure against, so the opening week of a
+    player's season carries a usage score and a null rolling average, delta, velocity
+    and trend; the weeks after it slope against the earliest week still inside the
+    window, per week elapsed. A week whose player was absent for longer than the window
+    carries no velocity and no trend either: there is no recent series under it.
+
     Every rolling window groups by ``gsis_id``. Display names collide across
     the league — multiple active players share a name in any given season —
     so a name-keyed window splices two players into one series.
@@ -107,20 +114,38 @@ def compute_usage_trends(
     # Delta
     df = df.with_columns((pl.col("usage_score") - pl.col("rolling_avg")).alias("delta"))
 
-    # Velocity (slope)
+    # `shift` counts a player's appearances, not weeks, so a lag reaches a week whose
+    # distance depends on which weeks the player was active. Each candidate lag is
+    # admitted only where the weeks it spans fall inside the window, and the slope
+    # divides by those weeks: a player back from an absence longer than the window has
+    # no series to slope across, and one back from a shorter absence slopes across the
+    # weeks that passed rather than the rows.
+    lags = range(window - 1, 0, -1)
+
+    def earlier(lag: int) -> pl.Expr:
+        return pl.col("usage_score").shift(lag).over("gsis_id", "season")
+
+    def span(lag: int) -> pl.Expr:
+        return pl.col("week") - pl.col("week").shift(lag).over("gsis_id", "season")
+
+    # Velocity: slope per week elapsed, across the widest span the window holds.
     df = df.with_columns(
-        (
-            (
-                pl.col("usage_score")
-                - pl.col("usage_score").shift(window - 1).over("gsis_id", "season")
-            )
-            / (window - 1)
+        pl.coalesce(
+            [
+                pl.when((span(lag) > 0) & (span(lag) <= window - 1)).then(
+                    (pl.col("usage_score") - earlier(lag)) / span(lag)
+                )
+                for lag in lags
+            ]
         ).alias("velocity")
     )
 
-    # Trend classification
+    # Trend classification. A week with nothing behind it has no direction to name, and
+    # a null says so where any label would assert movement that was never measured.
     df = df.with_columns(
-        pl.when((pl.col("delta") > 2) & (pl.col("velocity") > 0))
+        pl.when(pl.col("velocity").is_null())
+        .then(pl.lit(None, dtype=pl.String))
+        .when((pl.col("delta") > 2) & (pl.col("velocity") > 0))
         .then(pl.lit("rising"))
         .when((pl.col("delta") < -2) & (pl.col("velocity") < 0))
         .then(pl.lit("falling"))
@@ -128,8 +153,7 @@ def compute_usage_trends(
         .alias("trend")
     )
 
-    # Drop incomplete rows and select output columns
-    return df.drop_nulls(subset=["rolling_avg", "velocity"]).select(
+    return df.select(
         "gsis_id",
         "player",
         "position",

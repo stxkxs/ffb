@@ -922,6 +922,7 @@ _PBP_SCHEMA = {
     "rusher_player_name": pl.String,
     "fumbled_1_player_id": pl.String,
     "fumbled_1_player_name": pl.String,
+    "fumbled_1_team": pl.String,
 }
 
 _PBP_ZERO = {
@@ -980,7 +981,23 @@ def _carry(team: str, *, yards: float = 0.0, td: float = 0.0, fumbled: float = 0
         fields["fumble_lost"] = fumbled
         fields["fumbled_1_player_id"] = league_gsis_id(team, "RB")
         fields["fumbled_1_player_name"] = league_player_name(team, "RB")
+        fields["fumbled_1_team"] = team
     return fields
+
+
+def _return_fumble(kicking: str, returning: str) -> dict:
+    """One punt by `kicking` whose returner, of `returning`, loses the ball.
+
+    `posteam` is the kicking team on a return, so the fumbler's team is the one team
+    the play does not name as holding the ball.
+    """
+    return {
+        "play_type": "punt",
+        "fumble_lost": 1.0,
+        "fumbled_1_player_id": league_gsis_id(returning, "WR"),
+        "fumbled_1_player_name": league_player_name(returning, "WR"),
+        "fumbled_1_team": returning,
+    }
 
 
 def _dead_ball(play_type: str) -> dict:

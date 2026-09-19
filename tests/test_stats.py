@@ -54,6 +54,7 @@ PBP_SCHEMA = {
     "rusher_player_name": pl.String,
     "fumbled_1_player_id": pl.String,
     "fumbled_1_player_name": pl.String,
+    "fumbled_1_team": pl.String,
 }
 
 #: Columns that count events or yardage, and so read zero rather than null on a
@@ -186,6 +187,7 @@ def carry(
         fields["fumble_lost"] = 1.0
         fields["fumbled_1_player_id"] = fumbler.player_id
         fields["fumbled_1_player_name"] = fumbler.name
+        fields["fumbled_1_team"] = offense
     return play(**fields)
 
 
@@ -500,14 +502,33 @@ def test_omitting_rosters_nulls_the_position_column_and_leaves_the_rest(
 # ── Fumbles away from scrimmage ──────────────────────────────────────────────
 
 
-def return_fumble(fumbler: Player, *, play_type: str) -> dict[str, object]:
-    """One `play_type` snap that `fumbler` loses on a fumble."""
+def return_fumble(fumbler: Player, *, play_type: str, team: str = HOME) -> dict[str, object]:
+    """One `play_type` snap that `fumbler`, of `team`, loses on a fumble.
+
+    A return is the one play where the fumbler's team is not the team with the ball, so
+    `team` and `posteam` are set apart.
+    """
     return play(
         play_type=play_type,
         fumble_lost=1.0,
         fumbled_1_player_id=fumbler.player_id,
         fumbled_1_player_name=fumbler.name,
+        fumbled_1_team=team,
     )
+
+
+def test_a_fumble_on_a_return_is_charged_to_the_fumblers_own_team() -> None:
+    """`posteam` names the kicking team on a return, and the returner is not on it.
+
+    Charging the fumble to `posteam` would give the returner a second weekly line under
+    a team they never played for, which every join keyed on the team then doubles.
+    """
+    stats = compute_weekly_stats_from_pbp(
+        frame([return_fumble(CARRIER, play_type="punt", team=AWAY)])
+    )
+    line = rows_for(stats, CARRIER)
+    assert line.height == 1
+    assert line["recent_team"].item() == AWAY
 
 
 @pytest.mark.parametrize("play_type", ["kickoff", "punt"])
@@ -556,6 +577,27 @@ DISAGREEING_NAMES_WEEK = [
     throw(PASSER, spelled("receiving"), yards=10.0),
     carry(spelled("rushing"), yards=10.0, fumbler=spelled("fumbling")),
 ]
+
+
+def test_a_player_spelled_differently_within_one_role_yields_one_line() -> None:
+    """Identity is the id inside a role as much as across roles.
+
+    nflverse spells a name from the source field of each play, so two plays in one week
+    can name one receiver differently. Grouping on the spelling would split the week
+    into two partial lines, each carrying part of the targets.
+    """
+    stats = compute_weekly_stats_from_pbp(
+        frame(
+            [
+                throw(PASSER, CATCHER, yards=10.0),
+                throw(PASSER, Player(CATCHER.player_id, "B.Lindqvist"), yards=20.0),
+            ]
+        )
+    )
+    line = rows_for(stats, CATCHER)
+    assert line.height == 1
+    assert line["targets"].item() == 2.0
+    assert line["receiving_yards"].item() == 30.0
 
 
 def test_a_player_spelled_differently_across_roles_yields_one_line() -> None:

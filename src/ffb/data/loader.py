@@ -4,11 +4,14 @@ nflverse publishes a season as its own set of release assets, and the per-game a
 — play-by-play, snap counts, weekly stats, injuries — appear only once games have been
 played. A season the calendar names can therefore have no asset to read.
 
-Every loader taking a season list resolves it one season at a time, so a season with no
-asset contributes no rows while the seasons beside it render. A request whose every
-season is unpublished raises rather than yielding an empty frame: a frame with no
-columns has no `season` column for a screen to derive its filter options from, and
-raises `ColumnNotFoundError` the moment an engine filters it.
+Every loader taking a season list resolves it one season at a time, so a season the
+request does not obtain contributes no rows while the seasons beside it render. A
+request that obtains none of its seasons raises rather than yielding an empty frame: a
+frame with no columns has no `season` column for a screen to derive its filter options
+from, and raises `ColumnNotFoundError` the moment an engine filters it.
+
+What a request does not obtain, it cannot explain. A missing asset and a failed
+transfer reach these loaders as the same exception, so nothing below names a cause.
 """
 
 import logging
@@ -27,7 +30,7 @@ _DOWNLOAD_TIMEOUT = 120  # seconds
 
 
 class _SeasonUnavailable(Exception):
-    """Signals one season the source holds no asset for."""
+    """Signals one season a request did not obtain."""
 
 
 def _download(
@@ -65,43 +68,66 @@ def _download(
     return outcome["value"]
 
 
-def _nflverse(importer: str, *args: Any) -> pl.DataFrame:
+def _nflverse(importer: str, *args: Any, **options: Any) -> pl.DataFrame:
     """Fetch a frame from the named nfl_data_py importer, under the download timeout.
+
+    `options` are keyword arguments for the importer. Binding them onto the callable
+    here rather than forwarding them through `_download` leaves that function one
+    keyword, its own timeout, and no way for an importer argument to shadow it.
 
     nfl_data_py is imported here rather than at module scope because it pulls in
     pandas and numpy, and the TUI reaches its first frame without paying that cost.
     """
     import nfl_data_py as nfl  # type: ignore[import-untyped]
 
-    pdf = _download(getattr(nfl, importer), *args)
+    pdf = _download(partial(getattr(nfl, importer), **options), *args)
     return pl.from_pandas(pdf)
 
 
-def _nflverse_season(importer: str, season: int) -> pl.DataFrame:
+def _nflverse_season(importer: str, season: int, **options: Any) -> pl.DataFrame:
     """Fetch one season from the named importer, or raise `_SeasonUnavailable`.
 
-    A season with no release asset takes one of two shapes. nfl_data_py reads the asset
-    URL directly, so a missing asset arrives as the 404 urllib raises: `HTTPError`,
-    which derives from `OSError`.
+    A read that does not return a season takes one of two shapes. nfl_data_py reads the
+    asset URL directly, so a missing asset arrives as the 404 urllib raises:
+    `HTTPError`, which derives from `OSError`. A transport failure — a reset connection,
+    a DNS failure — derives from `OSError` too, and arrives the same way.
 
     `import_pbp_data` cannot report a failed download at all. Its download handler
     reads `except Error as e`, and `Error` is bound nowhere in that module, so reaching
     the handler raises `NameError` in place of the failure that reached it — run
     `inspect.getsource(nfl.import_pbp_data)` to read the handler. `NameError` is
-    therefore the only signal that importer emits for a season it cannot download.
+    therefore the only signal that importer emits for a season it cannot download,
+    whatever stopped the download.
 
-    `TimeoutError` derives from `OSError` too, and a stalled transfer says nothing
-    about what nflverse holds, so it passes through as itself.
+    Neither shape distinguishes an asset that does not exist from one that could not be
+    read, which is why nothing here reports why a season dropped.
+
+    `TimeoutError` derives from `OSError` too, and the caller set that deadline, so it
+    passes through as itself.
 
     Narrowing the catch to this one call into nfl_data_py keeps a `NameError` raised
     anywhere in this repository a `NameError`.
     """
     try:
-        return _nflverse(importer, [season])
+        return _nflverse(importer, [season], **options)
     except TimeoutError:
         raise
     except (OSError, NameError) as e:
-        raise _SeasonUnavailable(f"{importer} holds no {season} data: {e}") from e
+        raise _SeasonUnavailable(f"{importer} returned no {season} data: {e}") from e
+
+
+def _nflverse_pbp(season: int) -> pl.DataFrame:
+    """One season of play-by-play, without the participation sidecar.
+
+    `import_pbp_data` reads the play-by-play asset and a per-season participation
+    sidecar under one `try`, and the nflverse releases carry the two independently:
+    a season can hold play-by-play and no sidecar. Reading both together means the
+    sidecar's absence discards the play-by-play beside it, so the merge is declined
+    rather than depended on. No column this repository reads comes from the sidecar —
+    `import_pbp_data` merges it on `play_id` and `old_game_id` and contributes only
+    columns named nowhere in `src`.
+    """
+    return _nflverse_season("import_pbp_data", season, include_participation=False)
 
 
 def _cached(
@@ -150,23 +176,24 @@ def _by_season(
     served from a partial the first stored.
 
     Raising on a request that resolves nothing keeps an empty frame out of the engines.
-    The message names the seasons and the source, so the error a screen reports says
-    which season to wait on.
+    The message names the seasons it obtained nothing for. What it does not name is a
+    cause: a season drops on a missing asset and on a failed transfer alike, and the
+    two are indistinguishable at this layer.
     """
     if not seasons:
         raise RuntimeError(f"No {label} available: no seasons requested (got {seasons})")
 
     frames: list[pl.DataFrame] = []
-    unpublished: list[int] = []
+    dropped: list[int] = []
     for season in sorted(set(seasons)):
         try:
             frames.append(_cached(f"{prefix}_{season}", fetch, season, force_refresh=force_refresh))
         except _SeasonUnavailable as e:
-            log.warning("skipping %d, nflverse has published no %s for it: %s", season, label, e)
-            unpublished.append(season)
+            log.warning("skipping %d, no %s obtained for it: %s", season, label, e)
+            dropped.append(season)
 
     if not frames:
-        raise RuntimeError(f"nflverse has not published {label} for {_seasons_phrase(unpublished)}")
+        raise RuntimeError(f"No {label} obtained for {_seasons_phrase(dropped)}")
 
     return pl.concat(frames, how="diagonal_relaxed")
 
@@ -193,7 +220,7 @@ def load_pbp(
     return _by_season(
         "play-by-play",
         "pbp",
-        partial(_nflverse_season, "import_pbp_data"),
+        _nflverse_pbp,
         seasons,
         force_refresh=force_refresh,
     )
@@ -229,7 +256,7 @@ def _fetch_weekly_stats(season: int) -> pl.DataFrame:
     except _SeasonUnavailable as e:
         log.info("weekly data unavailable for %d, deriving from PBP: %s", season, e)
 
-    pbp_df = _nflverse_season("import_pbp_data", season)
+    pbp_df = _nflverse_pbp(season)
     roster_df: pl.DataFrame | None
     try:
         roster_df = _nflverse_season("import_seasonal_rosters", season)

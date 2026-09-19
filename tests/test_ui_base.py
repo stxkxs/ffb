@@ -1005,16 +1005,116 @@ async def test_start_sit_says_so_when_no_season_carries_a_completed_week(
 
 
 @piloted
-async def test_trade_value_says_so_when_no_season_reaches_the_week_a_ranking_rests_on(
+async def test_trade_value_offers_a_season_too_few_weeks_deep_to_rank(
     monkeypatch: pytest.MonkeyPatch,
     fixture_frames: dict[str, pl.DataFrame],
 ) -> None:
-    """A season fewer weeks deep than the floor ranks nobody, and the table says why."""
+    """A season the ranking cannot yet run on is still the season being played.
+
+    Withholding it from the filter would leave the season before it selected, and a
+    finished season's final chart would read as the live one.
+    """
+    weekly = fixture_frames["load_weekly_stats"]
+    played = weekly.filter(pl.col("week") < trade_value_screen.MIN_WEEKS_PLAYED)
+    frames_for(monkeypatch, played, fixture_frames["load_schedules"], fixture_frames)
+    latest = max(played["season"].unique().drop_nulls().to_list())
+
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert view.query_one("#tv-filter-season", Select).value == latest
+
+
+@piloted
+async def test_trade_value_says_why_the_selected_season_ranks_nobody(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """A season fewer weeks deep than the floor ranks nobody, and the table names it."""
+    weekly = fixture_frames["load_weekly_stats"]
+    played = weekly.filter(pl.col("week") < trade_value_screen.MIN_WEEKS_PLAYED)
+    frames_for(monkeypatch, played, fixture_frames["load_schedules"], fixture_frames)
+    latest = max(played["season"].unique().drop_nulls().to_list())
+
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert view.query_one("#tv-table", DataTable).row_count == 0
+        assert str(view.query_one("#tv-table-empty", Static).visual) == (
+            f"No trade values for {latest}. A ranking rests on "
+            f"{trade_value_screen.MIN_WEEKS_PLAYED} completed weeks "
+            f"and {latest} carries fewer."
+        )
+
+
+@piloted
+async def test_trade_value_asks_for_a_season_when_the_filter_is_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """An empty filter is a choice not yet made, not a season the data is missing.
+
+    Reporting it as absent data would have the table contradict the season filter
+    standing beside it, which still lists every loaded season.
+    """
     frames_for(
         monkeypatch,
-        fixture_frames["load_weekly_stats"].filter(
-            pl.col("week") < trade_value_screen.MIN_WEEKS_PLAYED
-        ),
+        fixture_frames["load_weekly_stats"],
+        fixture_frames["load_schedules"],
+        fixture_frames,
+    )
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        view.query_one("#tv-filter-season", Select).clear()
+        await settle(pilot)
+
+        assert (
+            str(view.query_one("#tv-table-empty", Static).visual)
+            == trade_value_screen.NO_SEASON_SELECTED
+        )
+
+
+@piloted
+async def test_trade_value_drops_the_week_options_when_the_season_is_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """A week belongs to a season, so no season leaves no week to offer."""
+    frames_for(
+        monkeypatch,
+        fixture_frames["load_weekly_stats"],
+        fixture_frames["load_schedules"],
+        fixture_frames,
+    )
+    view = trade_value_screen.TradeValueView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        assert view.selected("tv-filter-week") is not None
+
+        view.query_one("#tv-filter-season", Select).clear()
+        await settle(pilot)
+
+        assert view.selected("tv-filter-week") is None
+
+
+@piloted
+async def test_trade_value_says_so_when_no_season_carries_a_played_week(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_frames: dict[str, pl.DataFrame],
+) -> None:
+    """With no season played at all there is none to name, so the table says only that."""
+    weekly = fixture_frames["load_weekly_stats"]
+    frames_for(
+        monkeypatch,
+        weekly.filter(pl.col("season_type") != "REG"),
         fixture_frames["load_schedules"],
         fixture_frames,
     )
@@ -1026,5 +1126,5 @@ async def test_trade_value_says_so_when_no_season_reaches_the_week_a_ranking_res
         assert view.query_one("#tv-table", DataTable).row_count == 0
         assert (
             str(view.query_one("#tv-table-empty", Static).visual)
-            == trade_value_screen.NO_RANKABLE_WEEKS
+            == trade_value_screen.NO_PLAYED_WEEKS
         )

@@ -59,7 +59,7 @@ def _cells(row: dict[str, Any]) -> tuple[str, ...]:
         _fmt(row["rolling_avg"], ".1f"),
         _fmt(row["delta"], "+.1f"),
         _fmt(row["velocity"], "+.1f"),
-        row["trend"],
+        row["trend"] or MISSING,
     )
 
 
@@ -182,7 +182,9 @@ class WaiverWireView(ToolView):
         """Split the filtered frame into the two alert panels and the full listing.
 
         Rising sorts by steepest climb and falling by steepest drop, so the top row of
-        each panel is the player whose usage moved the most.
+        each panel is the player whose usage moved the most. The full listing sorts the
+        same way and puts the weeks carrying no velocity last, behind every week whose
+        movement is measured.
         """
         rising = df.filter(pl.col("trend") == "rising").sort("velocity", descending=True)
         self.fill_table(
@@ -202,7 +204,7 @@ class WaiverWireView(ToolView):
 
         self.fill_table(
             "ww-all-table",
-            df.sort("velocity", descending=True),
+            df.sort("velocity", descending=True, nulls_last=True),
             _cells,
             "No players match these filters. Widen the position, team or week filter.",
         )

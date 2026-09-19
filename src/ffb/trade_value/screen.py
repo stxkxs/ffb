@@ -37,19 +37,25 @@ COLUMNS = (
 #: Seasons the load asks for. Production, schedule and usage read the one season
 #: selected; the health component reads injury weeks across every season loaded, so a
 #: second season buys a longer availability history. The season filter offers the
-#: loaded seasons a ranking can run on, which is narrower: a season nflverse has
-#: published a schedule for carries no results until its games have been played.
+#: loaded seasons a week has been played in, which is narrower than the schedule: a
+#: season carries a schedule months before it carries a result.
 SEASON_WINDOW = 2
 
 #: Weeks of results a ranking rests on. The engine ranks nobody below this, so the week
-#: filter offers no week below it either.
+#: filter offers no week below it either. The season filter is not gated on it: a season
+#: too few weeks deep to rank is still the season a trade is being made in, and offering
+#: the one before it as the default would present a finished season as the live chart.
 MIN_WEEKS_PLAYED = 3
 
-#: Stands in for the table when no loaded season carries enough played weeks to rank.
-NO_RANKABLE_WEEKS = (
-    f"No season has the {MIN_WEEKS_PLAYED} completed weeks a ranking rests on. "
-    "nflverse publishes a season's weekly stats once its games have been played."
+#: Stands in for the table when no loaded season carries a played week at all.
+NO_PLAYED_WEEKS = (
+    "No loaded season carries a played week. A season's weekly stats appear once its "
+    "games have been played."
 )
+
+#: Stands in for the table where the filters, not the data, leave the chart unranked.
+NO_SEASON_SELECTED = "Select a season to rank."
+NO_WEEK_SELECTED = "Select a week to rank through."
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +77,27 @@ def _rankable_weeks(weekly: pl.DataFrame, season: int) -> list[int]:
     off the results rather than off the schedule: a schedule carries every week of a
     season from the moment nflverse publishes it, months before the first is played.
     """
-    played = (
+    return sorted(
+        week
+        for week in _played_weeks(weekly, season)
+        if MIN_WEEKS_PLAYED <= week < REGULAR_SEASON_WEEKS
+    )
+
+
+def _played_weeks(weekly: pl.DataFrame, season: int) -> list[int]:
+    """Regular-season weeks of `season` the weekly stats carry results for, in order.
+
+    A season is offered in the filter as soon as one of its weeks has been played,
+    which is earlier than a ranking can run. The two thresholds are deliberately
+    apart: what the filter offers is which season the user is looking at, and what
+    the engine ranks is whether there is enough behind it to rank.
+    """
+    return sorted(
         weekly.filter((pl.col("season") == season) & (pl.col("season_type") == "REG"))["week"]
         .unique()
         .drop_nulls()
         .to_list()
     )
-    return sorted(week for week in played if MIN_WEEKS_PLAYED <= week < REGULAR_SEASON_WEEKS)
 
 
 def _value_row(row: dict[str, Any]) -> tuple[str, ...]:
@@ -152,7 +172,7 @@ class TradeValueView(ToolView):
         seasons = sorted(
             season
             for season in reg["season"].unique().drop_nulls().to_list()
-            if _rankable_weeks(data.weekly, season)
+            if _played_weeks(data.weekly, season)
         )
         season_select = self.query_one("#tv-filter-season", Select)
         season_select.set_options([(str(s), s) for s in seasons])
@@ -165,12 +185,18 @@ class TradeValueView(ToolView):
         data = self._data
         if data is None:
             return
+        week_select = self.query_one("#tv-filter-week", Select)
+        team_select = self.query_one("#tv-filter-team", Select)
+
         season = self.selected("tv-filter-season")
         if season is None:
+            # A week and a team belong to a season. Left standing, they would offer the
+            # weeks of whichever season was selected before.
+            week_select.set_options([])
+            team_select.set_options([])
             return
 
         weeks = _rankable_weeks(data.weekly, season)
-        week_select = self.query_one("#tv-filter-week", Select)
         week_select.set_options([(f"Week {w}", w) for w in weeks])
         if weeks:
             week_select.value = weeks[-1]
@@ -180,7 +206,6 @@ class TradeValueView(ToolView):
             set(reg["home_team"].unique().drop_nulls().to_list())
             | set(reg["away_team"].unique().drop_nulls().to_list())
         )
-        team_select = self.query_one("#tv-filter-team", Select)
         team_select.set_options(self.all_options(teams))
         team_select.value = ALL
 
@@ -192,11 +217,11 @@ class TradeValueView(ToolView):
 
         season = self.selected("tv-filter-season")
         week = self.selected("tv-filter-week")
-        # Both filters hold no selection until a load fills their options, and a load
-        # that reached no rankable week fills neither.
+        # The season filter holds no selection until a load fills it, and the week
+        # filter stays empty for a season fewer weeks deep than a ranking rests on.
         if not isinstance(season, int) or not isinstance(week, int):
             self._values = None
-            self.fill_table("tv-table", pl.DataFrame(), _value_row, NO_RANKABLE_WEEKS)
+            self.fill_table("tv-table", pl.DataFrame(), _value_row, self._no_ranking_message())
             return
 
         self._values = compute_trade_values(
@@ -209,6 +234,31 @@ class TradeValueView(ToolView):
             current_week=week,
         )
         self._apply_filters()
+
+    def _no_ranking_message(self) -> str:
+        """Say why the chart ranks nobody, separating absent data from an empty filter.
+
+        A season too few weeks deep to rank and a filter the user has cleared leave the
+        same two filters empty, and each has its own answer: one says what the season
+        does not yet carry, the other asks for a choice.
+        """
+        data = self._data
+        if data is None:
+            return NO_PLAYED_WEEKS
+
+        seasons = data.weekly["season"].unique().drop_nulls().to_list()
+        if not any(_played_weeks(data.weekly, season) for season in seasons):
+            return NO_PLAYED_WEEKS
+
+        season = self.selected("tv-filter-season")
+        if not isinstance(season, int):
+            return NO_SEASON_SELECTED
+        if not _rankable_weeks(data.weekly, season):
+            return (
+                f"No trade values for {season}. A ranking rests on {MIN_WEEKS_PLAYED} "
+                f"completed weeks and {season} carries fewer."
+            )
+        return NO_WEEK_SELECTED
 
     def _apply_filters(self) -> None:
         values = self._values
