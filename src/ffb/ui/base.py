@@ -354,8 +354,8 @@ class ToolView(Widget):
     def _render_elapsed(self) -> None:
         """Report the load as a named target and the time spent on it.
 
-        nfl_data_py downloads a release asset in one blocking call and reports no
-        progress, so a fraction or a bar would be invented. Elapsed time is measured.
+        A release asset downloads in one blocking call that reports no progress, so a
+        fraction or a bar would be invented. Elapsed time is measured.
         """
         minutes, seconds = divmod(int(monotonic() - self._load_started), 60)
         status = self.query_one(f"#{self.ID_PREFIX}-load-status", Static)

@@ -1,11 +1,32 @@
 """Derive weekly player stats from play-by-play data.
 
-Stands in for a season nflverse publishes no player_stats asset for, carrying the
+Stands in for a season nflverse publishes no weekly stats asset for, carrying the
 columns the tools read off that asset: identity, team, opponent, season type, the
-counting stats, and the PPR total derived from them.
+counting stats, and the PPR total derived from them. It is a reconstruction and not a
+copy: it reads the pass and run plays and the fumbles, and a week holding a two-point
+conversion, a lateral or a return counts differently here than in the published asset,
+which reads those too. Play-by-play names them; this does not read them.
 """
 
 import polars as pl
+
+
+def attach_position(df: pl.DataFrame, rosters: pl.DataFrame | None) -> pl.DataFrame:
+    """Add `position` to `df`, read off `rosters` and keyed on `player_id`.
+
+    The column belongs to the frame's shape whether or not rosters resolve: the engines
+    filter on position, and a null value filters to nothing where an absent column
+    raises. A player a season lists more than once takes their last listing.
+    """
+    if rosters is None:
+        return df.with_columns(pl.lit(None, dtype=pl.String).alias("position"))
+
+    pos_map = (
+        rosters.select("player_id", "position")
+        .drop_nulls()
+        .unique(subset=["player_id"], keep="last")
+    )
+    return df.join(pos_map, on="player_id", how="left")
 
 
 def compute_weekly_stats_from_pbp(
@@ -175,18 +196,4 @@ def compute_weekly_stats_from_pbp(
     # Add opponent_team
     df = df.join(opponent_map, on=["recent_team", "season", "week"], how="left")
 
-    # ── Position ─────────────────────────────────────────────
-    # The column belongs to the frame's shape whether or not rosters resolve: the
-    # engines filter on position, and a null value filters to nothing where an
-    # absent column raises.
-    if rosters is not None:
-        pos_map = (
-            rosters.select("player_id", "position")
-            .drop_nulls()
-            .unique(subset=["player_id"], keep="last")
-        )
-        df = df.join(pos_map, on="player_id", how="left")
-    else:
-        df = df.with_columns(pl.lit(None, dtype=pl.String).alias("position"))
-
-    return df.drop_nulls(subset=["player_id"])
+    return attach_position(df, rosters).drop_nulls(subset=["player_id"])

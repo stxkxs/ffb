@@ -121,7 +121,7 @@ no per-game rows for.
 helper. `force_refresh` skips the cache read, not the write, which is precisely what the
 Refresh button promises. A loader taking a season list resolves it through `_by_season`, one
 season and one cache key per season, and concatenates what came back. That split is what
-lets a published season render beside an unpublished one: `nfl_data_py` satisfies a
+lets a published season render beside an unpublished one: an nflreadpy loader satisfies a
 multi-season request only once every season in it has been read, so a single 404 inside a
 batched request costs every season beside it. A request that resolves no season at all
 raises, naming the seasons and the dataset, rather than handing an engine a frame with no

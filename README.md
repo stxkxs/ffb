@@ -87,7 +87,7 @@ filters by position, team, season and as-of week.
 
 ## Stack
 
-- **Data:** [nflverse](https://github.com/nflverse/nflverse-data) via `nfl_data_py` (free, no auth)
+- **Data:** [nflverse](https://github.com/nflverse/nflverse-data) via `nflreadpy` (free, no auth)
 - **Processing:** `polars`
 - **TUI:** `textual`
 
@@ -130,7 +130,7 @@ the first download succeeds, so the wait falls once per dataset season and then 
 for six hours.
 
 **Watching a load.** The loading pane names what is downloading and counts elapsed time as
-`MM:SS`, updated once a second. `nfl_data_py` downloads a release asset in one blocking call
+`MM:SS`, updated once a second. A release asset downloads in one blocking call
 and reports no progress, so elapsed time is the only honest readout — there is no percentage
 or bar.
 
@@ -150,15 +150,17 @@ again.
 
 **A season a load does not obtain.** The season label rolls over on 1 September, while
 nflverse publishes a season's play-by-play, snap counts, weekly stats and injuries only
-once its games have been played — so for the opening days of September every tool asks for
-a season the source answers `HTTP Error 404` for. That season contributes no rows and the
-seasons beside it render: each loader resolves its season list one season at a time, so a
-season that does not resolve costs only itself.
+once its games are under way — so for the opening days of September every tool asks for a
+season the source has no asset for. That season contributes no rows and the seasons beside
+it render: each loader resolves its season list one season at a time, so a season that does
+not resolve costs only itself.
 
 A transport failure costs the same season the same way, and reaches the loaders as the same
 exception. Nothing below the loaders distinguishes the two, so nothing reports which one
 happened; a season that disappears on one load and returns on the next was a failed
-transfer, and one that stays absent is waiting on the source.
+transfer, and one that stays absent is waiting on the source. A season a loader refuses by
+range is dropped the same way, and the ceiling it checks against is not the cut the season
+label turns on.
 
 The drop reaches the interface, because every screen builds its season filter from the
 seasons its data carries rows for. The absent season is absent from the filter, and the
@@ -170,7 +172,8 @@ earlier than it can rank one — the season being played is the season a trade i
 and the chart says what it is still short of rather than falling back to a finished season.
 
 Nothing negative is cached, so the season joins the filter on the first load that obtains
-it. The price is one failed request per absent asset per load.
+it. The price is one refused request per absent asset per load, and none at all for a
+season a loader declines before asking.
 
 **`Failed to load data: No snap counts obtained for season 2026`.** Every season the tool
 asked for dropped, so the load has nothing to render. The message names the dataset and the

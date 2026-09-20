@@ -618,6 +618,17 @@ def league_snap_counts() -> pl.DataFrame:
 
 
 @pytest.fixture()
+def published_rosters(rosters: pl.DataFrame) -> pl.DataFrame:
+    """`rosters` in the shape the nflverse asset publishes it.
+
+    The asset spells the player's GSIS id `gsis_id`; play-by-play, weekly stats and
+    every engine joining them spell it `player_id`, and `loader._seasonal_rosters` is
+    where the two meet.
+    """
+    return rosters.rename({"player_id": "gsis_id"})
+
+
+@pytest.fixture()
 def rosters() -> pl.DataFrame:
     """Seasonal rosters for both league seasons.
 

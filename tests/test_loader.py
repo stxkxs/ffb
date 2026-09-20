@@ -1,16 +1,14 @@
 """Tests for the caching, download and fallback behaviour around the loaders.
 
-No test reaches the network: `FakeNflverse` replaces `loader._nflverse`, the single
-seam every loader fetches through, and the download tests pass their own callable to
+No test reaches the network: `FakeNflreadpy` stands in for the nflreadpy module the
+loaders read through, and the download tests pass their own callable to
 `loader._download`.
 """
 
-import email.message
+import ast
 import json
-import sys
+import pathlib
 import threading
-import types
-import urllib.error
 from collections.abc import Callable
 from typing import Any
 
@@ -21,31 +19,39 @@ from ffb.data import cache, loader
 from tests.conftest import league_gsis_id
 
 
-class FakeNflverse:
-    """Stand-in for `loader._nflverse` that records every call it is given.
+class FakeNflreadpy:
+    """Stand-in for the nflreadpy module that records every loader call it is given.
 
-    Each keyword names an nfl_data_py importer and gives what that importer yields:
-    a frame to return, or a callable taking the arguments the loader passes. An
-    importer with no keyword raises `KeyError`, so a loader reaching for data the
-    test did not describe fails loudly.
+    Each keyword names an nflreadpy loader and gives what that loader yields: a frame
+    to return, or a callable taking the arguments the caller passes. A loader with no
+    keyword raises `AttributeError`, so a fetch for data the test did not describe
+    fails as loudly as it would against a module that has no such loader.
 
-    A call records its keyword arguments alongside its positional ones, so a test can
-    assert the options a loader sends an importer and not only the season it asks for.
+    Standing in for the module rather than for the function that reads through it
+    leaves `_nflverse_season` under test: the exception mapping, the empty-frame rule
+    and the renames each loader applies all run.
     """
 
-    def __init__(self, **importers: Any) -> None:
-        self.importers = importers
-        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    def __init__(self, **loaders: Any) -> None:
+        self.loaders = loaders
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
-    def __call__(self, importer: str, *args: Any, **options: Any) -> pl.DataFrame:
-        self.calls.append((importer, args, options))
-        handler = self.importers[importer]
-        return handler(*args) if callable(handler) else handler
+    def __getattr__(self, name: str) -> Callable[..., pl.DataFrame]:
+        loaders = self.__dict__["loaders"]
+        if name not in loaders:
+            raise AttributeError(f"the test described no {name!r} loader")
+
+        def call(*args: Any) -> pl.DataFrame:
+            self.calls.append((name, args))
+            handler = loaders[name]
+            return handler(*args) if callable(handler) else handler
+
+        return call
 
     @property
     def names(self) -> list[str]:
-        """The importers called, in call order."""
-        return [name for name, _, _ in self.calls]
+        """The loaders called, in call order."""
+        return [name for name, _ in self.calls]
 
 
 def marked(marker: int) -> pl.DataFrame:
@@ -55,35 +61,34 @@ def marked(marker: int) -> pl.DataFrame:
 
 _RELEASE_URL = (
     "https://github.com/nflverse/nflverse-data/releases/download"
-    "/player_stats/player_stats_2099.parquet"
+    "/stats_player/stats_player_week_2099.parquet"
 )
 
 
 def unavailable(*args: Any) -> pl.DataFrame:
-    """An importer whose release asset is not published.
+    """A loader whose release asset is not published.
 
-    nfl_data_py reads a season straight from its GitHub release asset URL, so a
-    season with no asset surfaces as the 404 urllib raises: `HTTPError`, which
-    derives from `OSError`. The fallback tests are pinned to that exception, so
-    they hold against what nflverse hands the loader.
+    nflreadpy wraps the HTTP failure in `ConnectionError`, which derives from
+    `OSError`, and raises the same exception for a transfer that fails part way. The
+    fallback tests are pinned to that exception, so they hold against both.
     """
-    raise urllib.error.HTTPError(
-        url=_RELEASE_URL,
-        code=404,
-        msg="Not Found",
-        hdrs=email.message.Message(),
-        fp=None,
-    )
+    raise ConnectionError(f"Failed to download {_RELEASE_URL}: 404 Client Error: Not Found")
 
 
 def published_weekly(season: int, points: float) -> pl.DataFrame:
-    """One row of weekly stats in the shape nflverse publishes them."""
+    """One row of weekly stats in the shape nflverse publishes them.
+
+    The asset spells the player's team `team`, and carries both a `position` naming the
+    listing and a `position_group` naming the side of the ball. The loader renames the
+    first and keeps the group.
+    """
     return pl.DataFrame(
         {
             "player_id": ["00-0999"],
             "player_display_name": ["Published Starter"],
-            "recent_team": ["NYG"],
-            "position": ["WR"],
+            "team": ["NYG"],
+            "position": ["FB"],
+            "position_group": ["RB"],
             "season": [season],
             "week": [1],
             "season_type": ["REG"],
@@ -101,11 +106,11 @@ def cache_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def nflverse(monkeypatch):
-    """Install a `FakeNflverse` over the loader's fetch seam."""
+    """Install a `FakeNflreadpy` in place of the module the loaders read through."""
 
-    def install(**importers: Any) -> FakeNflverse:
-        fake = FakeNflverse(**importers)
-        monkeypatch.setattr(loader, "_nflverse", fake)
+    def install(**loaders: Any) -> FakeNflreadpy:
+        fake = FakeNflreadpy(**loaders)
+        monkeypatch.setattr(loader, "_nflreadpy", lambda: fake)
         return fake
 
     return install
@@ -127,43 +132,43 @@ def stall():
 # ── Cache reads and writes ───────────────────────────────────────────────────
 
 
-def test_a_miss_fetches_from_the_importer_the_loader_names(nflverse):
-    fake = nflverse(import_snap_counts=marked(1))
+def test_a_miss_fetches_through_the_loader_it_names(nflverse):
+    fake = nflverse(load_snap_counts=marked(1))
     loader.load_snap_counts([2025])
-    assert fake.calls == [("import_snap_counts", ([2025],), {})]
+    assert fake.calls == [("load_snap_counts", ([2025],))]
 
 
 def test_a_fresh_entry_is_served_without_a_second_fetch(nflverse):
-    fake = nflverse(import_snap_counts=marked(1))
+    fake = nflverse(load_snap_counts=marked(1))
     loader.load_snap_counts([2025])
     loader.load_snap_counts([2025])
-    assert fake.names == ["import_snap_counts"]
+    assert fake.names == ["load_snap_counts"]
 
 
 def test_a_served_entry_carries_the_values_that_were_fetched(nflverse):
-    nflverse(import_snap_counts=marked(7))
+    nflverse(load_snap_counts=marked(7))
     loader.load_snap_counts([2025])
     assert loader.load_snap_counts([2025])["marker"].to_list() == [7]
 
 
 def test_force_refresh_fetches_past_a_fresh_entry(nflverse):
     markers = iter([1, 2])
-    fake = nflverse(import_snap_counts=lambda seasons: marked(next(markers)))
+    fake = nflverse(load_snap_counts=lambda seasons: marked(next(markers)))
     loader.load_snap_counts([2025])
     loader.load_snap_counts([2025], force_refresh=True)
-    assert fake.names == ["import_snap_counts", "import_snap_counts"]
+    assert fake.names == ["load_snap_counts", "load_snap_counts"]
 
 
 def test_force_refresh_returns_the_frame_it_fetched(nflverse):
     markers = iter([1, 2])
-    nflverse(import_snap_counts=lambda seasons: marked(next(markers)))
+    nflverse(load_snap_counts=lambda seasons: marked(next(markers)))
     loader.load_snap_counts([2025])
     assert loader.load_snap_counts([2025], force_refresh=True)["marker"].to_list() == [2]
 
 
 def test_force_refresh_stores_the_frame_it_fetched(nflverse):
     markers = iter([1, 2])
-    nflverse(import_snap_counts=lambda seasons: marked(next(markers)))
+    nflverse(load_snap_counts=lambda seasons: marked(next(markers)))
     loader.load_snap_counts([2025])
     loader.load_snap_counts([2025], force_refresh=True)
     # A third fetch would exhaust `markers`, so this frame comes from the cache.
@@ -174,7 +179,7 @@ def test_force_refresh_stores_the_frame_it_fetched(nflverse):
 
 
 def test_a_key_names_the_dataset_and_the_one_season_it_holds(nflverse, cache_dir):
-    nflverse(import_pbp_data=marked(1))
+    nflverse(load_pbp=marked(1))
     loader.load_pbp([2025, 2024])
     assert sorted(path.name for path in cache_dir.glob("*.parquet")) == [
         "pbp_2024.parquet",
@@ -183,34 +188,34 @@ def test_a_key_names_the_dataset_and_the_one_season_it_holds(nflverse, cache_dir
 
 
 def test_a_season_asked_for_in_a_second_ordering_is_served_from_the_cache(nflverse):
-    fake = nflverse(import_snap_counts=marked(1))
+    fake = nflverse(load_snap_counts=marked(1))
     loader.load_snap_counts([2024, 2025])
     loader.load_snap_counts([2025, 2024])
     # The two fetches are the first request's two seasons; the second request adds none.
-    assert fake.names == ["import_snap_counts", "import_snap_counts"]
+    assert fake.names == ["load_snap_counts", "load_snap_counts"]
 
 
 def test_datasets_sharing_a_season_hold_separate_entries(nflverse):
-    nflverse(import_snap_counts=marked(1), import_pbp_data=marked(2))
+    nflverse(load_snap_counts=marked(1), load_pbp=marked(2))
     loader.load_snap_counts([2025])
     assert loader.load_pbp([2025])["marker"].to_list() == [2]
 
 
 def test_distinct_seasons_of_one_dataset_hold_separate_entries(nflverse):
-    nflverse(import_snap_counts=lambda seasons: marked(sum(seasons)))
+    nflverse(load_snap_counts=lambda seasons: marked(sum(seasons)))
     loader.load_snap_counts([2024])
     loader.load_snap_counts([2025])
     assert loader.load_snap_counts([2024])["marker"].to_list() == [2024]
 
 
 def test_the_player_crosswalk_is_fetched_without_seasons(nflverse):
-    fake = nflverse(import_ids=marked(1))
+    fake = nflverse(load_ff_playerids=marked(1))
     loader.load_player_ids()
-    assert fake.calls == [("import_ids", (), {})]
+    assert fake.calls == [("load_ff_playerids", ())]
 
 
 def test_the_player_crosswalk_is_stored_under_a_key_naming_no_seasons(nflverse, cache_dir):
-    nflverse(import_ids=marked(1))
+    nflverse(load_ff_playerids=marked(1))
     loader.load_player_ids()
     assert [path.name for path in cache_dir.glob("*.parquet")] == ["player_ids.parquet"]
 
@@ -224,8 +229,8 @@ def test_a_download_returns_what_the_fetch_produced():
 
 def test_a_download_forwards_its_positional_arguments():
     received: list[Any] = []
-    loader._download(lambda *args: received.append(args), "import_pbp_data", [2025])
-    assert received == [("import_pbp_data", [2025])]
+    loader._download(lambda *args: received.append(args), "load_pbp", [2025])
+    assert received == [("load_pbp", [2025])]
 
 
 def test_a_failing_fetch_raises_on_the_calling_thread():
@@ -266,62 +271,102 @@ def nyg_receiver_week_one(weekly: pl.DataFrame) -> pl.DataFrame:
 
 
 def test_a_published_season_passes_through_unchanged(nflverse):
-    nflverse(import_weekly_data=lambda seasons: published_weekly(seasons[0], 12.5))
+    nflverse(load_player_stats=lambda seasons: published_weekly(seasons[0], 12.5))
     weekly = loader.load_weekly_stats([2024])
     assert weekly["fantasy_points_ppr"].to_list() == [12.5]
 
 
-def test_an_unpublished_season_is_derived_from_play_by_play(nflverse, pbp, rosters):
+def test_a_published_season_carries_the_team_under_the_name_its_joins_use(nflverse):
+    """The asset spells it `team`; the frames it is joined to spell it `recent_team`."""
+    nflverse(load_player_stats=lambda seasons: published_weekly(seasons[0], 12.5))
+    weekly = loader.load_weekly_stats([2024])
+    assert weekly["recent_team"].to_list() == ["NYG"]
+    assert "team" not in weekly.columns
+
+
+def test_a_published_position_is_the_side_of_the_ball_not_the_listing(nflverse):
+    """The asset lists a fullback FB, which `OFFENSIVE_POSITIONS` does not hold.
+
+    Carrying the listing forward would drop that player from every tool filtering on
+    position, so `position_group`, which resolves a fullback to RB, is what the frame
+    carries.
+    """
+    nflverse(load_player_stats=lambda seasons: published_weekly(seasons[0], 12.5))
+    weekly = loader.load_weekly_stats([2024])
+    assert weekly["position"].to_list() == ["RB"]
+    assert "position_group" not in weekly.columns
+
+
+def test_a_published_season_reads_nothing_beside_the_asset(nflverse):
+    """Position travels in the weekly frame, so the published path fetches one thing.
+
+    Reading the rosters here would make a roster failure cost a season the weekly asset
+    covers in full.
+    """
+    fake = nflverse(load_player_stats=lambda seasons: published_weekly(seasons[0], 12.5))
+    loader.load_weekly_stats([2024])
+    assert fake.names == ["load_player_stats"]
+
+
+def test_a_derived_season_the_rosters_do_not_cover_carries_a_null_position(nflverse, pbp):
+    """Play-by-play names no position, so the derivation has nowhere else to read one."""
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=unavailable,
+    )
+    assert loader.load_weekly_stats([2025])["position"].unique().to_list() == [None]
+
+
+def test_an_unpublished_season_is_derived_from_play_by_play(nflverse, pbp, published_rosters):
+    nflverse(
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     weekly = loader.load_weekly_stats([2025])
     assert nyg_receiver_week_one(weekly)["fantasy_points_ppr"].to_list() == [6.0]
 
 
-def test_derived_rows_count_the_targets_the_play_by_play_holds(nflverse, pbp, rosters):
+def test_derived_rows_count_the_targets_the_play_by_play_holds(nflverse, pbp, published_rosters):
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     weekly = loader.load_weekly_stats([2025])
     assert nyg_receiver_week_one(weekly)["targets"].to_list() == [5.0]
 
 
-def test_derived_rows_carry_the_position_the_rosters_list(nflverse, pbp, rosters):
+def test_derived_rows_carry_the_position_the_rosters_list(nflverse, pbp, published_rosters):
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     weekly = loader.load_weekly_stats([2025])
     assert nyg_receiver_week_one(weekly)["position"].to_list() == ["WR"]
 
 
-def test_only_the_unpublished_seasons_reach_the_fallback(nflverse, pbp, rosters):
+def test_only_the_unpublished_seasons_reach_the_fallback(nflverse, pbp, published_rosters):
     fake = nflverse(
-        import_weekly_data=lambda seasons: (
+        load_player_stats=lambda seasons: (
             published_weekly(2024, 12.5) if seasons == [2024] else unavailable()
         ),
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     loader.load_weekly_stats([2024, 2025])
-    assert [call for call in fake.calls if call[0] == "import_pbp_data"] == [
-        ("import_pbp_data", ([2025],), {"include_participation": False})
-    ]
+    assert [call for call in fake.calls if call[0] == "load_pbp"] == [("load_pbp", ([2025],))]
 
 
-def test_a_published_row_survives_beside_derived_rows(nflverse, pbp, rosters):
+def test_a_published_row_survives_beside_derived_rows(nflverse, pbp, published_rosters):
     nflverse(
-        import_weekly_data=lambda seasons: (
+        load_player_stats=lambda seasons: (
             published_weekly(2024, 12.5) if seasons == [2024] else unavailable()
         ),
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     weekly = loader.load_weekly_stats([2024, 2025])
     published = weekly.filter(pl.col("season") == 2024)
@@ -330,9 +375,9 @@ def test_a_published_row_survives_beside_derived_rows(nflverse, pbp, rosters):
 
 def test_derivation_proceeds_when_the_rosters_are_unpublished(nflverse, pbp):
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=unavailable,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=unavailable,
     )
     weekly = loader.load_weekly_stats([2025])
     assert nyg_receiver_week_one(weekly)["fantasy_points_ppr"].to_list() == [6.0]
@@ -343,23 +388,23 @@ def test_a_stalled_roster_download_propagates(nflverse, pbp):
         raise TimeoutError("Download timed out after 120s.")
 
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=stalled,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=stalled,
     )
     with pytest.raises(TimeoutError):
         loader.load_weekly_stats([2025])
 
 
-@pytest.mark.parametrize("failure", [ValueError, AttributeError])
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError])
 def test_a_roster_failure_that_is_not_unavailability_propagates(nflverse, pbp, failure):
     def refuse(seasons: list[int]) -> pl.DataFrame:
         raise failure("upstream refused the request")
 
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=refuse,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=refuse,
     )
     with pytest.raises(failure):
         loader.load_weekly_stats([2025])
@@ -367,61 +412,61 @@ def test_a_roster_failure_that_is_not_unavailability_propagates(nflverse, pbp, f
 
 def test_a_roster_failure_that_is_not_unavailability_stores_nothing(nflverse, pbp, cache_dir):
     def refuse(seasons: list[int]) -> pl.DataFrame:
-        raise ValueError("upstream refused the request")
+        raise RuntimeError("upstream refused the request")
 
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=refuse,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=refuse,
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         loader.load_weekly_stats([2025])
     assert list(cache_dir.glob("*.parquet")) == []
 
 
-@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError, TimeoutError])
 def test_a_weekly_failure_that_is_not_unavailability_propagates(nflverse, failure):
     def refuse(seasons: list[int]) -> pl.DataFrame:
         raise failure("upstream refused the request")
 
-    nflverse(import_weekly_data=refuse)
+    nflverse(load_player_stats=refuse, load_rosters=unavailable)
     with pytest.raises(failure):
         loader.load_weekly_stats([2025])
 
 
-@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError, TimeoutError])
 def test_a_weekly_failure_that_is_not_unavailability_skips_the_fallback(nflverse, failure):
     def refuse(seasons: list[int]) -> pl.DataFrame:
         raise failure("upstream refused the request")
 
-    fake = nflverse(import_weekly_data=refuse)
+    fake = nflverse(load_player_stats=refuse)
     with pytest.raises(failure):
         loader.load_weekly_stats([2025])
-    assert fake.names == ["import_weekly_data"]
+    assert fake.names == ["load_player_stats"]
 
 
 def test_a_weekly_failure_that_is_not_unavailability_stores_nothing(nflverse, cache_dir):
     def refuse(seasons: list[int]) -> pl.DataFrame:
-        raise ValueError("upstream refused the request")
+        raise RuntimeError("upstream refused the request")
 
-    nflverse(import_weekly_data=refuse)
-    with pytest.raises(ValueError):
+    nflverse(load_player_stats=refuse, load_rosters=unavailable)
+    with pytest.raises(RuntimeError):
         loader.load_weekly_stats([2025])
     assert list(cache_dir.glob("*.parquet")) == []
 
 
 @pytest.mark.parametrize("published", [(True, True), (True, False), (False, True), (False, False)])
 def test_a_request_naming_seasons_yields_rows_however_they_are_sourced(
-    nflverse, pbp, rosters, published
+    nflverse, pbp, published_rosters, published
 ):
     """Every named season lands in the published set or the fallback, never neither."""
     sourced = dict(zip([2024, 2025], published, strict=True))
     nflverse(
-        import_weekly_data=lambda seasons: (
+        load_player_stats=lambda seasons: (
             published_weekly(seasons[0], 12.5) if sourced[seasons[0]] else unavailable()
         ),
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     assert loader.load_weekly_stats([2024, 2025]).height > 0
 
@@ -438,40 +483,44 @@ def test_a_request_for_no_seasons_is_the_condition_the_message_names(nflverse):
         loader.load_weekly_stats([])
 
 
-def test_a_request_for_no_seasons_reaches_no_importer(nflverse):
+def test_a_request_for_no_seasons_reaches_no_loader(nflverse):
     fake = nflverse()
     with pytest.raises(RuntimeError):
         loader.load_weekly_stats([])
     assert fake.names == []
 
 
-def test_derived_weekly_stats_are_cached_under_their_season_key(nflverse, pbp, rosters, cache_dir):
+def test_derived_weekly_stats_are_cached_under_their_season_key(
+    nflverse, pbp, published_rosters, cache_dir
+):
     nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     loader.load_weekly_stats([2025])
     assert (cache_dir / "weekly_stats_2025.parquet").exists()
 
 
-def test_a_derived_season_is_fetched_once_and_then_served_from_the_cache(nflverse, pbp, rosters):
+def test_a_derived_season_is_fetched_once_and_then_served_from_the_cache(
+    nflverse, pbp, published_rosters
+):
     fake = nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
+        load_player_stats=unavailable,
+        load_pbp=pbp,
+        load_rosters=published_rosters,
     )
     loader.load_weekly_stats([2025])
     loader.load_weekly_stats([2025])
     assert fake.names == [
-        "import_weekly_data",
-        "import_pbp_data",
-        "import_seasonal_rosters",
+        "load_player_stats",
+        "load_pbp",
+        "load_rosters",
     ]
 
 
 def test_a_completed_load_leaves_no_temporary_file(nflverse, cache_dir):
-    nflverse(import_snap_counts=marked(1))
+    nflverse(load_snap_counts=marked(1))
     loader.load_snap_counts([2025])
     assert sorted(path.name for path in cache_dir.iterdir()) == [
         "_meta.json",
@@ -480,7 +529,7 @@ def test_a_completed_load_leaves_no_temporary_file(nflverse, cache_dir):
 
 
 def test_a_stored_entry_is_recorded_under_the_key_it_was_stored_with(nflverse, cache_dir):
-    nflverse(import_injuries=marked(1))
+    nflverse(load_injuries=marked(1))
     loader.load_injuries([2024, 2025])
     meta = json.loads((cache_dir / "_meta.json").read_text())
     assert sorted(meta) == ["injuries_2024", "injuries_2025"]
@@ -494,15 +543,24 @@ def season_rows(season: int) -> pl.DataFrame:
     return pl.DataFrame({"season": [season]})
 
 
-def undefined_name(*args: Any) -> pl.DataFrame:
-    """An importer that cannot report the download it failed.
+def out_of_range(*args: Any) -> pl.DataFrame:
+    """A loader refusing a season before it reaches the network.
 
-    `nfl_data_py.import_pbp_data` handles a failed download with `except Error as e`,
-    and `Error` is bound nowhere in that module, so reaching the handler raises
-    NameError over the failure that reached it. A season that importer holds no asset
-    for arrives in this shape rather than as the 404 underneath it.
+    Every nflreadpy loader range-checks the season against the earliest one its release
+    holds and against the season it computes as current, and raises `ValueError`. The
+    ceiling moves with the calendar, so a season this repository resolves can sit above
+    it for the opening days of a September.
     """
-    raise NameError("name 'Error' is not defined")
+    raise ValueError("Season must be between 1999 and 2026")
+
+
+def empty(*args: Any) -> pl.DataFrame:
+    """A loader filtering an all-seasons asset down to no rows.
+
+    A loader whose release covers every season in one file answers a season it does not
+    hold with an empty frame rather than by failing.
+    """
+    return pl.DataFrame({"season": []}, schema={"season": pl.Int64})
 
 
 def source(
@@ -510,21 +568,26 @@ def source(
     rows: Callable[[int], pl.DataFrame] = season_rows,
     absent: Callable[..., pl.DataFrame] = unavailable,
 ) -> Callable[[list[int]], pl.DataFrame]:
-    """An importer holding `published` and no other season.
+    """A loader holding `published` and no other season.
 
-    nfl_data_py reads one release asset per season a request names and concatenates
-    them only once every read has returned, so a request naming one season with no
-    asset yields none of the seasons beside it. `absent` is the shape that failure
-    takes.
+    An nflreadpy loader reads one release asset per season a request names and
+    concatenates them only once every read has returned, so a request naming one season
+    with no asset yields none of the seasons beside it. `absent` is the shape that
+    failure takes.
     """
 
-    def importer(seasons: list[int]) -> pl.DataFrame:
+    def load(seasons: list[int]) -> pl.DataFrame:
         for season in seasons:
             if season not in published:
                 absent()
         return pl.concat([rows(season) for season in seasons])
 
-    return importer
+    return load
+
+
+def roster_rows(season: int) -> pl.DataFrame:
+    """A one-row roster frame in the shape the nflverse asset publishes."""
+    return pl.DataFrame({"season": [season], "gsis_id": ["00-0999"], "position": ["WR"]})
 
 
 def weekly_row(season: int) -> pl.DataFrame:
@@ -532,113 +595,156 @@ def weekly_row(season: int) -> pl.DataFrame:
     return published_weekly(season, 12.5)
 
 
-#: Loader name → the nfl_data_py importer it reads a season list through.
+#: ffb loader → the nflreadpy loader it reads a season list through, and the row shape
+#: that loader yields. Rosters differ: the asset carries the id the loader renames.
 SEASON_LOADERS = {
-    "load_injuries": "import_injuries",
-    "load_pbp": "import_pbp_data",
-    "load_rosters": "import_seasonal_rosters",
-    "load_schedules": "import_schedules",
-    "load_snap_counts": "import_snap_counts",
+    "load_injuries": ("load_injuries", season_rows),
+    "load_pbp": ("load_pbp", season_rows),
+    "load_rosters": ("load_rosters", roster_rows),
+    "load_schedules": ("load_schedules", season_rows),
+    "load_snap_counts": ("load_snap_counts", season_rows),
 }
 
 
-@pytest.mark.parametrize(("name", "importer"), sorted(SEASON_LOADERS.items()))
-def test_a_loader_taking_a_season_list_returns_the_seasons_the_source_holds(
-    nflverse, name, importer
-):
-    nflverse(**{importer: source(2025)})
+@pytest.mark.parametrize(("name", "reads"), sorted(SEASON_LOADERS.items()))
+def test_a_loader_taking_a_season_list_returns_the_seasons_the_source_holds(nflverse, name, reads):
+    nflreadpy_loader, rows = reads
+    nflverse(**{nflreadpy_loader: source(2025, rows=rows)})
     assert getattr(loader, name)([2025, 2026])["season"].to_list() == [2025]
 
 
-@pytest.mark.parametrize(("name", "importer"), sorted(SEASON_LOADERS.items()))
+@pytest.mark.parametrize(("name", "reads"), sorted(SEASON_LOADERS.items()))
 def test_a_loader_taking_a_season_list_raises_when_the_source_holds_none_of_them(
-    nflverse, name, importer
+    nflverse, name, reads
 ):
-    nflverse(**{importer: source()})
+    nflreadpy_loader, rows = reads
+    nflverse(**{nflreadpy_loader: source(rows=rows)})
     with pytest.raises(RuntimeError, match="obtained for"):
         getattr(loader, name)([2026])
 
 
 def test_a_published_season_is_returned_beside_an_unpublished_one(nflverse):
-    nflverse(import_snap_counts=source(2025))
+    nflverse(load_snap_counts=source(2025))
     assert loader.load_snap_counts([2025, 2026])["season"].to_list() == [2025]
 
 
 def test_each_season_is_asked_for_in_its_own_request(nflverse):
-    fake = nflverse(import_snap_counts=source(2025, 2026))
+    fake = nflverse(load_snap_counts=source(2025, 2026))
     loader.load_snap_counts([2026, 2025])
     assert fake.calls == [
-        ("import_snap_counts", ([2025],), {}),
-        ("import_snap_counts", ([2026],), {}),
+        ("load_snap_counts", ([2025],)),
+        ("load_snap_counts", ([2026],)),
     ]
 
 
-def test_the_participation_option_reaches_nfl_data_py(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The binding is exercised where every other test replaces the function that does it.
+def _loaders_reached_for() -> set[str]:
+    """Every nflreadpy loader `loader` reaches for, read off its own source.
 
-    `FakeNflverse` stands in for `loader._nflverse`, so an assertion made through it
-    observes the arguments the loader passed rather than the arguments nf_data_py
-    received. Dropping the binding would leave those assertions passing.
+    Reading the names rather than listing them here keeps this from being a second
+    place a rename has to land, and therefore a second place it can be wrong.
     """
-    import pandas
+    tree = ast.parse(pathlib.Path(loader.__file__).read_text())
+    names = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("load_")
+    }
+    names |= {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_nflreadpy"
+    }
+    return names
 
-    received: dict[str, Any] = {}
 
-    def import_pbp_data(seasons: list[int], **options: Any) -> "pandas.DataFrame":
-        received["seasons"] = seasons
-        received["options"] = options
-        return pandas.DataFrame({"season": seasons})
+def test_every_loader_reached_for_exists_on_the_module() -> None:
+    """A loader is named by a string, which nothing but the module itself can check.
 
-    module = types.ModuleType("nfl_data_py")
-    module.import_pbp_data = import_pbp_data  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "nfl_data_py", module)
-
-    loader._nflverse_pbp(2025)
-
-    assert received == {"seasons": [2025], "options": {"include_participation": False}}
-
-
-def test_play_by_play_is_asked_for_without_the_participation_sidecar(nflverse):
-    """The sidecar is a separate release asset a season can lack while holding play-by-play.
-
-    `import_pbp_data` reads both under one `try`, so requesting the sidecar makes its
-    absence discard the play-by-play beside it.
+    `FakeNflreadpy` answers to whatever name a test describes, so a name wrong in both
+    files passes every other test here and fails on the first live fetch.
     """
-    fake = nflverse(import_pbp_data=source(2025))
-    loader.load_pbp([2025])
-    assert fake.calls == [("import_pbp_data", ([2025],), {"include_participation": False})]
+    import nflreadpy
+
+    reached = _loaders_reached_for()
+    assert reached, "no loader names were found in the source"
+    assert sorted(name for name in reached if not hasattr(nflreadpy, name)) == []
 
 
-def test_the_weekly_fallback_asks_for_play_by_play_without_the_sidecar(nflverse, pbp, rosters):
-    """The derivation reaches play-by-play under the same terms the direct loader does.
+def test_the_module_is_configured_before_anything_reads_through_it() -> None:
+    """Settings taken from the environment would make a fetch depend on the shell.
 
-    nflverse publishes weekly stats per season after the fact, so a season in progress
-    reaches this path rather than the published asset.
+    This reaches the real module because the configuration is what is under test: a
+    stand-in would assert only that the test set what the test set.
     """
-    fake = nflverse(
-        import_weekly_data=unavailable,
-        import_pbp_data=pbp,
-        import_seasonal_rosters=rosters,
-    )
-    loader.load_weekly_stats([2025])
-    assert [call for call in fake.calls if call[0] == "import_pbp_data"] == [
-        ("import_pbp_data", ([2025],), {"include_participation": False})
-    ]
+    from nflreadpy.config import get_config
+
+    loader._nflreadpy.cache_clear()
+    try:
+        loader._nflreadpy()
+        config = get_config()
+        assert config.cache_mode.value == "memory"
+        assert config.timeout == loader._DOWNLOAD_TIMEOUT
+    finally:
+        loader._nflreadpy.cache_clear()
 
 
-def test_an_unpublished_season_reported_as_a_name_error_contributes_no_rows(nflverse):
-    nflverse(import_pbp_data=source(2025, absent=undefined_name))
+def test_a_season_the_loader_refuses_by_range_contributes_no_rows(nflverse):
+    """A refusal raised before the network still costs one season and no more.
+
+    `ValueError` is not an `OSError`, so a catch written for the download alone would
+    let this abort the whole request.
+    """
+    nflverse(load_pbp=source(2025, absent=out_of_range))
     assert loader.load_pbp([2025, 2026])["season"].to_list() == [2025]
 
 
+def test_a_season_the_loader_answers_with_no_rows_contributes_none(nflverse, cache_dir):
+    """An all-seasons asset filters rather than fails, and an empty answer is not data.
+
+    The rows it contributes are none either way, so what pins the rule is the key it
+    does not write: a stored emptiness would be served until the entry went stale,
+    where a season left unwritten is asked for again.
+    """
+    nflverse(load_schedules=lambda seasons: season_rows(2025) if seasons == [2025] else empty())
+    assert loader.load_schedules([2025, 2026])["season"].to_list() == [2025]
+    assert sorted(path.name for path in cache_dir.glob("*.parquet")) == ["schedules_2025.parquet"]
+
+
+def test_a_season_answered_with_no_rows_is_asked_for_again(nflverse):
+    """Nothing negative is stored, so a season joins the next request that obtains it."""
+    published: set[int] = {2025}
+    fake = nflverse(
+        load_schedules=lambda seasons: (
+            season_rows(seasons[0]) if seasons[0] in published else empty()
+        )
+    )
+    loader.load_schedules([2025, 2026])
+    published.add(2026)
+    assert loader.load_schedules([2025, 2026])["season"].to_list() == [2025, 2026]
+    assert fake.names.count("load_schedules") == 3
+
+
+def test_a_season_answered_with_no_rows_stores_nothing(nflverse, cache_dir):
+    """Caching an empty answer would serve it until the entry went stale."""
+    nflverse(load_schedules=empty)
+    with pytest.raises(RuntimeError, match="obtained for"):
+        loader.load_schedules([2026])
+    assert list(cache_dir.glob("*.parquet")) == []
+
+
 def test_a_request_holding_no_published_season_raises(nflverse):
-    nflverse(import_snap_counts=source())
+    nflverse(load_snap_counts=source())
     with pytest.raises(RuntimeError):
         loader.load_snap_counts([2025, 2026])
 
 
 def test_a_request_holding_no_published_season_names_the_seasons(nflverse):
-    nflverse(import_snap_counts=source())
+    nflverse(load_snap_counts=source())
     with pytest.raises(RuntimeError, match="2025, 2026"):
         loader.load_snap_counts([2025, 2026])
 
@@ -650,25 +756,25 @@ def test_a_request_holding_no_published_season_blames_no_cause(nflverse):
     loader cannot tell the two apart. Naming nflverse in the message would send a
     reader to wait on a publication that may already have happened.
     """
-    nflverse(import_snap_counts=source())
+    nflverse(load_snap_counts=source())
     with pytest.raises(RuntimeError, match="^No snap counts obtained for seasons 2025, 2026$"):
         loader.load_snap_counts([2025, 2026])
 
 
 def test_a_request_holding_no_published_season_names_the_dataset(nflverse):
-    nflverse(import_injuries=source())
+    nflverse(load_injuries=source())
     with pytest.raises(RuntimeError, match="injur"):
         loader.load_injuries([2026])
 
 
 def test_a_request_holding_no_published_season_stores_nothing(nflverse, cache_dir):
-    nflverse(import_snap_counts=source())
+    nflverse(load_snap_counts=source())
     with pytest.raises(RuntimeError):
         loader.load_snap_counts([2025, 2026])
     assert list(cache_dir.glob("*.parquet")) == []
 
 
-@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError, TimeoutError])
 def test_a_failure_that_is_not_unavailability_propagates(nflverse, failure):
     """A stalled transfer carries no information about what nflverse holds.
 
@@ -680,17 +786,17 @@ def test_a_failure_that_is_not_unavailability_propagates(nflverse, failure):
     def refuse(seasons: list[int]) -> pl.DataFrame:
         raise failure("upstream refused the request")
 
-    nflverse(import_snap_counts=refuse)
+    nflverse(load_snap_counts=refuse)
     with pytest.raises(failure):
         loader.load_snap_counts([2025, 2026])
 
 
-@pytest.mark.parametrize("failure", [ValueError, AttributeError, TimeoutError])
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError, TimeoutError])
 def test_a_failure_that_is_not_unavailability_stores_nothing(nflverse, cache_dir, failure):
     def refuse(seasons: list[int]) -> pl.DataFrame:
         raise failure("upstream refused the request")
 
-    nflverse(import_snap_counts=refuse)
+    nflverse(load_snap_counts=refuse)
     with pytest.raises(failure):
         loader.load_snap_counts([2025, 2026])
     assert list(cache_dir.glob("*.parquet")) == []
@@ -700,26 +806,26 @@ def test_a_failure_that_is_not_unavailability_stores_nothing(nflverse, cache_dir
 
 
 def test_only_the_seasons_that_resolved_are_stored(nflverse, cache_dir):
-    nflverse(import_snap_counts=source(2025))
+    nflverse(load_snap_counts=source(2025))
     loader.load_snap_counts([2025, 2026])
     assert [path.name for path in cache_dir.glob("*.parquet")] == ["snap_counts_2025.parquet"]
 
 
 def test_a_season_published_after_a_partial_load_reaches_the_result(nflverse):
-    fake = nflverse(import_snap_counts=source(2025))
+    fake = nflverse(load_snap_counts=source(2025))
     loader.load_snap_counts([2025, 2026])
-    fake.importers["import_snap_counts"] = source(2025, 2026)
+    fake.loaders["load_snap_counts"] = source(2025, 2026)
     assert loader.load_snap_counts([2025, 2026])["season"].to_list() == [2025, 2026]
 
 
 def test_a_season_stored_by_a_partial_load_is_served_from_the_cache(nflverse):
-    fake = nflverse(import_snap_counts=source(2025))
+    fake = nflverse(load_snap_counts=source(2025))
     loader.load_snap_counts([2025, 2026])
     loader.load_snap_counts([2025, 2026])
     assert fake.calls == [
-        ("import_snap_counts", ([2025],), {}),
-        ("import_snap_counts", ([2026],), {}),
-        ("import_snap_counts", ([2026],), {}),
+        ("load_snap_counts", ([2025],)),
+        ("load_snap_counts", ([2026],)),
+        ("load_snap_counts", ([2026],)),
     ]
 
 
@@ -728,18 +834,20 @@ def test_a_season_stored_by_a_partial_load_is_served_from_the_cache(nflverse):
 
 def test_a_season_covered_by_neither_weekly_asset_nor_play_by_play_is_skipped(nflverse):
     nflverse(
-        import_weekly_data=source(2025, rows=weekly_row),
-        import_pbp_data=source(absent=undefined_name),
-        import_seasonal_rosters=source(),
+        load_player_stats=source(2025, rows=weekly_row),
+        load_pbp=source(absent=out_of_range),
+        load_rosters=source(),
     )
     assert loader.load_weekly_stats([2025, 2026])["season"].to_list() == [2025]
 
 
-def test_a_derived_season_survives_beside_a_season_neither_asset_covers(nflverse, pbp, rosters):
+def test_a_derived_season_survives_beside_a_season_neither_asset_covers(
+    nflverse, pbp, published_rosters
+):
     nflverse(
-        import_weekly_data=source(),
-        import_pbp_data=lambda seasons: pbp if seasons == [2025] else unavailable(),
-        import_seasonal_rosters=lambda seasons: rosters if seasons == [2025] else unavailable(),
+        load_player_stats=source(),
+        load_pbp=lambda seasons: pbp if seasons == [2025] else unavailable(),
+        load_rosters=lambda seasons: published_rosters if seasons == [2025] else unavailable(),
     )
     weekly = loader.load_weekly_stats([2025, 2026])
     assert weekly["season"].unique().to_list() == [2025]
@@ -747,9 +855,9 @@ def test_a_derived_season_survives_beside_a_season_neither_asset_covers(nflverse
 
 def test_weekly_stats_covered_by_neither_asset_in_any_season_raise(nflverse):
     nflverse(
-        import_weekly_data=source(),
-        import_pbp_data=source(absent=undefined_name),
-        import_seasonal_rosters=source(),
+        load_player_stats=source(),
+        load_pbp=source(absent=out_of_range),
+        load_rosters=source(),
     )
     with pytest.raises(RuntimeError, match="obtained for"):
         loader.load_weekly_stats([2025, 2026])
@@ -757,9 +865,9 @@ def test_weekly_stats_covered_by_neither_asset_in_any_season_raise(nflverse):
 
 def test_a_season_covered_by_neither_asset_stores_nothing(nflverse, cache_dir):
     nflverse(
-        import_weekly_data=source(2025, rows=weekly_row),
-        import_pbp_data=source(absent=undefined_name),
-        import_seasonal_rosters=source(),
+        load_player_stats=source(2025, rows=weekly_row),
+        load_pbp=source(absent=out_of_range),
+        load_rosters=source(),
     )
     loader.load_weekly_stats([2025, 2026])
     assert [path.name for path in cache_dir.glob("*.parquet")] == ["weekly_stats_2025.parquet"]

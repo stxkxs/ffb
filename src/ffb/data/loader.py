@@ -1,4 +1,4 @@
-"""Data loaders wrapping nfl_data_py with local caching.
+"""Data loaders wrapping nflreadpy with local caching.
 
 nflverse publishes a season as its own set of release assets, and the per-game assets
 — play-by-play, snap counts, weekly stats, injuries — appear only once games have been
@@ -12,12 +12,16 @@ from, and raises `ColumnNotFoundError` the moment an engine filters it.
 
 What a request does not obtain, it cannot explain. A missing asset and a failed
 transfer reach these loaders as the same exception, so nothing below names a cause.
+
+nflreadpy spells a column as the nflverse release spells it. Where a release spells one
+differently from the frames it is joined to, the loader returning it renames it here,
+so no engine has to know two spellings for one thing.
 """
 
 import logging
 import threading
 from collections.abc import Callable
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import polars as pl
@@ -26,7 +30,14 @@ from ffb.data import cache
 
 log = logging.getLogger(__name__)
 
+#: Deadline for one loader call, which may cover several requests.
 _DOWNLOAD_TIMEOUT = 120  # seconds
+
+#: The message nflreadpy raises `ValueError` with for a season outside a loader's range.
+#: Its downloader raises `ValueError` for anything that goes wrong after a response
+#: arrives as well, and the message is what separates a season it declined from a
+#: payload it could not read.
+_OUT_OF_RANGE = "Season must be between"
 
 
 class _SeasonUnavailable(Exception):
@@ -68,66 +79,81 @@ def _download(
     return outcome["value"]
 
 
-def _nflverse(importer: str, *args: Any, **options: Any) -> pl.DataFrame:
-    """Fetch a frame from the named nfl_data_py importer, under the download timeout.
+@lru_cache(maxsize=1)
+def _nflreadpy() -> Any:
+    """The nflreadpy module, configured before anything reads through it.
 
-    `options` are keyword arguments for the importer. Binding them onto the callable
-    here rather than forwarding them through `_download` leaves that function one
-    keyword, its own timeout, and no way for an importer argument to shadow it.
+    nflreadpy takes its settings from the environment and from a `.env` file in the
+    working directory. Writing them here instead leaves what the process happens to
+    inherit unable to change how a season is fetched.
 
-    nfl_data_py is imported here rather than at module scope because it pulls in
-    pandas and numpy, and the TUI reaches its first frame without paying that cost.
+    Its cache holds what it downloaded in memory, keyed by URL. That is worth keeping
+    beside `cache`, which stores by season: a release that covers every season in one
+    asset is downloaded once for a request naming several, where a per-season store has
+    no way to know the two seasons came from one file. Nothing is written to disk
+    twice, because only the memory mode is on.
+
+    Its timeout governs one request, and setting it to the deadline `_download` already
+    holds leaves that the only one that fires — a transfer that stalls is reported as a
+    stall rather than as a season the request could not obtain.
+
+    The import is deferred to first use, and the TUI reaches its first frame without
+    paying for it.
     """
-    import nfl_data_py as nfl  # type: ignore[import-untyped]
+    import nflreadpy  # type: ignore[import-untyped]
+    from nflreadpy.config import CacheMode, update_config  # type: ignore[import-untyped]
 
-    pdf = _download(partial(getattr(nfl, importer), **options), *args)
-    return pl.from_pandas(pdf)
+    update_config(cache_mode=CacheMode.MEMORY, timeout=_DOWNLOAD_TIMEOUT)
+    return nflreadpy
 
 
-def _nflverse_season(importer: str, season: int, **options: Any) -> pl.DataFrame:
-    """Fetch one season from the named importer, or raise `_SeasonUnavailable`.
+def _nflverse_season(loader: str, season: int) -> pl.DataFrame:
+    """Fetch one season through the named nflreadpy loader, or raise `_SeasonUnavailable`.
 
-    A read that does not return a season takes one of two shapes. nfl_data_py reads the
-    asset URL directly, so a missing asset arrives as the 404 urllib raises:
-    `HTTPError`, which derives from `OSError`. A transport failure — a reset connection,
-    a DNS failure — derives from `OSError` too, and arrives the same way.
+    A read that yields no season takes one of three shapes.
 
-    `import_pbp_data` cannot report a failed download at all. Its download handler
-    reads `except Error as e`, and `Error` is bound nowhere in that module, so reaching
-    the handler raises `NameError` in place of the failure that reached it — run
-    `inspect.getsource(nfl.import_pbp_data)` to read the handler. `NameError` is
-    therefore the only signal that importer emits for a season it cannot download,
-    whatever stopped the download.
+    An asset nflverse does not publish and a transfer that fails both arrive as the
+    `ConnectionError` nflreadpy raises around the HTTP failure. It derives from
+    `OSError`, and it is the same exception either way, which is what makes the cause
+    unknowable at this layer.
 
-    Neither shape distinguishes an asset that does not exist from one that could not be
-    read, which is why nothing here reports why a season dropped.
+    Some loaders range-check the season before requesting anything and raise
+    `ValueError` for one their release does not reach. The ceiling moves with the
+    calendar and is not the cut `seasons.season_for` makes, so a season this repository
+    resolves can sit above it. `load_player_stats` and `load_schedules` do not check,
+    and answer the same season with a 404 and an empty frame instead — which is why
+    every shape below drops one season rather than the request.
+
+    nflreadpy's downloader also raises `ValueError` for anything that goes wrong once a
+    response has arrived, a payload it cannot parse among it. That is a failure to read
+    what was fetched rather than a season the source will not give, so only the range
+    check is caught here and the rest carries to the caller: a season silently missing
+    is worse than a load that stops.
+
+    A loader whose release covers every season in one asset filters that asset rather
+    than failing, so a season it does not hold returns a frame with no rows. A season
+    that yields no rows is a season not obtained, and raising rather than returning it
+    keeps an empty frame out of the cache — the next request asks the source again
+    instead of being served a stored emptiness for as long as the entry stays fresh.
 
     `TimeoutError` derives from `OSError` too, and the caller set that deadline, so it
     passes through as itself.
-
-    Narrowing the catch to this one call into nfl_data_py keeps a `NameError` raised
-    anywhere in this repository a `NameError`.
     """
+    fetch = getattr(_nflreadpy(), loader)
     try:
-        return _nflverse(importer, [season], **options)
+        df: pl.DataFrame = _download(fetch, [season])
     except TimeoutError:
         raise
-    except (OSError, NameError) as e:
-        raise _SeasonUnavailable(f"{importer} returned no {season} data: {e}") from e
+    except OSError as e:
+        raise _SeasonUnavailable(f"{loader} returned no {season} data: {e}") from e
+    except ValueError as e:
+        if _OUT_OF_RANGE not in str(e):
+            raise
+        raise _SeasonUnavailable(f"{loader} does not reach {season}: {e}") from e
 
-
-def _nflverse_pbp(season: int) -> pl.DataFrame:
-    """One season of play-by-play, without the participation sidecar.
-
-    `import_pbp_data` reads the play-by-play asset and a per-season participation
-    sidecar under one `try`, and the nflverse releases carry the two independently:
-    a season can hold play-by-play and no sidecar. Reading both together means the
-    sidecar's absence discards the play-by-play beside it, so the merge is declined
-    rather than depended on. No column this repository reads comes from the sidecar —
-    `import_pbp_data` merges it on `play_id` and `old_game_id` and contributes only
-    columns named nowhere in `src`.
-    """
-    return _nflverse_season("import_pbp_data", season, include_participation=False)
+    if df.height == 0:
+        raise _SeasonUnavailable(f"{loader} returned no {season} rows")
+    return df
 
 
 def _cached(
@@ -167,13 +193,13 @@ def _by_season(
     """Concatenate one cached frame per season, dropping the seasons the source has none of.
 
     A season is the unit of both the request and the cache entry. Asking for one season
-    at a time is what makes tolerance possible at all: nfl_data_py returns a multi-season
-    request only once every season in it has been read, so one unpublished season in a
-    request costs every published season beside it. Storing one season per key follows
-    from the same split — a request that resolves some of its seasons writes only the
-    seasons it holds, so no key promises a season list it never obtained, and a season
-    the source publishes between two requests is fetched by the second rather than
-    served from a partial the first stored.
+    at a time is what makes tolerance possible at all: an nflreadpy loader given a list
+    reads the seasons in it one after another and raises on the first it cannot read, so
+    one absent season in a request costs every season beside it. Storing one season per
+    key follows from the same split — a request that resolves some of its seasons writes
+    only the seasons it holds, so no key promises a season list it never obtained, and a
+    season the source publishes between two requests is fetched by the second rather
+    than served from a partial the first stored.
 
     Raising on a request that resolves nothing keeps an empty frame out of the engines.
     The message names the seasons it obtained nothing for. What it does not name is a
@@ -206,7 +232,7 @@ def load_snap_counts(
     return _by_season(
         "snap counts",
         "snap_counts",
-        partial(_nflverse_season, "import_snap_counts"),
+        partial(_nflverse_season, "load_snap_counts"),
         seasons,
         force_refresh=force_refresh,
     )
@@ -220,10 +246,19 @@ def load_pbp(
     return _by_season(
         "play-by-play",
         "pbp",
-        _nflverse_pbp,
+        partial(_nflverse_season, "load_pbp"),
         seasons,
         force_refresh=force_refresh,
     )
+
+
+def _seasonal_rosters(season: int) -> pl.DataFrame:
+    """One season of rosters, carrying the player id under the name its joins use.
+
+    The roster asset spells the player's GSIS id `gsis_id`. Play-by-play, weekly stats
+    and every engine that joins them spell it `player_id`.
+    """
+    return _nflverse_season("load_rosters", season).rename({"gsis_id": "player_id"})
 
 
 def load_rosters(
@@ -234,7 +269,7 @@ def load_rosters(
     return _by_season(
         "rosters",
         "rosters",
-        partial(_nflverse_season, "import_seasonal_rosters"),
+        _seasonal_rosters,
         seasons,
         force_refresh=force_refresh,
     )
@@ -243,27 +278,35 @@ def load_rosters(
 def _fetch_weekly_stats(season: int) -> pl.DataFrame:
     """One season of weekly player stats, derived from play-by-play where nflverse has none.
 
-    nflverse publishes player_stats as one release asset per season, so a season in
-    progress can have no asset at all while its play-by-play updates every week.
-    Play-by-play carries what the weekly columns are built from, so a season missing
-    the asset is reconstructed rather than dropped. A season neither asset covers
-    raises `_SeasonUnavailable`, which drops that season from the request.
+    The weekly asset updates through a season rather than landing complete at the end
+    of one, so it covers a season being played. A season it does not carry at all is
+    reconstructed from play-by-play, which holds the counting stats but names no
+    position — the rosters are read for that path alone, and a season neither path
+    covers raises `_SeasonUnavailable`, dropping it from the request.
+
+    Position is read from `position_group` rather than from the asset's `position`,
+    which labels a fullback FB and a two-way player by the side of the ball they are
+    listed on; `OFFENSIVE_POSITIONS` holds neither. `position_group` resolves both to
+    the side they play and travels in the frame that carries them, so the published
+    path needs nothing fetched beside it.
     """
     from ffb.data.stats import compute_weekly_stats_from_pbp
 
     try:
-        return _nflverse_season("import_weekly_data", season)
+        weekly = _nflverse_season("load_player_stats", season)
     except _SeasonUnavailable as e:
-        log.info("weekly data unavailable for %d, deriving from PBP: %s", season, e)
+        log.info("no weekly stats asset for %d, deriving from play-by-play: %s", season, e)
+    else:
+        return weekly.drop("position").rename({"team": "recent_team", "position_group": "position"})
 
-    pbp_df = _nflverse_pbp(season)
-    roster_df: pl.DataFrame | None
+    pbp = _nflverse_season("load_pbp", season)
+    rosters: pl.DataFrame | None
     try:
-        roster_df = _nflverse_season("import_seasonal_rosters", season)
+        rosters = _seasonal_rosters(season)
     except _SeasonUnavailable as e:
-        log.warning("roster data unavailable for %d, positions will be null: %s", season, e)
-        roster_df = None
-    return compute_weekly_stats_from_pbp(pbp_df, roster_df)
+        log.warning("no rosters for %d, positions will be null: %s", season, e)
+        rosters = None
+    return compute_weekly_stats_from_pbp(pbp, rosters)
 
 
 def load_weekly_stats(
@@ -280,14 +323,22 @@ def load_weekly_stats(
     )
 
 
+def _player_crosswalk() -> pl.DataFrame:
+    """The player id table carrying the pfr_id and gsis_id spellings of one player.
+
+    The table covers every season at once, so it is fetched whole rather than by season.
+    """
+    df: pl.DataFrame = _download(_nflreadpy().load_ff_playerids)
+    return df
+
+
 def load_player_ids(
     force_refresh: bool = False,
 ) -> pl.DataFrame:
     """Load player ID crosswalk table (pfr_id <-> gsis_id), with caching."""
     return _cached(
         "player_ids",
-        _nflverse,
-        "import_ids",
+        _player_crosswalk,
         force_refresh=force_refresh,
     )
 
@@ -300,7 +351,7 @@ def load_schedules(
     return _by_season(
         "schedules",
         "schedules",
-        partial(_nflverse_season, "import_schedules"),
+        partial(_nflverse_season, "load_schedules"),
         seasons,
         force_refresh=force_refresh,
     )
@@ -314,7 +365,7 @@ def load_injuries(
     return _by_season(
         "injuries",
         "injuries",
-        partial(_nflverse_season, "import_injuries"),
+        partial(_nflverse_season, "load_injuries"),
         seasons,
         force_refresh=force_refresh,
     )
