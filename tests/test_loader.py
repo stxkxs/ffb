@@ -541,26 +541,27 @@ def test_a_stored_entry_is_recorded_under_the_key_it_was_stored_with(nflverse, c
 def test_a_dropped_season_reaches_an_open_record(nflverse):
     """A returned frame names the seasons it holds, and nothing names the ones it does not."""
     nflverse(load_snap_counts=source(2025))
-    with loader.collect_drops() as dropped:
+    with loader.collect_notices() as notices:
         loader.load_snap_counts([2025, 2026])
-    assert dropped == [("snap counts", 2026)]
+    assert notices.dropped == [("snap counts", 2026)]
 
 
 def test_a_request_that_drops_nothing_records_nothing(nflverse):
     nflverse(load_snap_counts=source(2025, 2026))
-    with loader.collect_drops() as dropped:
+    with loader.collect_notices() as notices:
         loader.load_snap_counts([2025, 2026])
-    assert dropped == []
+    assert notices.dropped == []
+    assert not notices
 
 
 def test_a_record_names_every_dataset_its_block_dropped(nflverse):
     """One load reaches several loaders, and each drops its seasons on its own."""
     nflverse(load_snap_counts=source(), load_injuries=source(2025))
-    with loader.collect_drops() as dropped:
+    with loader.collect_notices() as notices:
         with pytest.raises(RuntimeError):
             loader.load_snap_counts([2026])
         loader.load_injuries([2025, 2026])
-    assert dropped == [("snap counts", 2026), ("injuries", 2026)]
+    assert notices.dropped == [("snap counts", 2026), ("injuries", 2026)]
 
 
 def test_a_loader_outside_a_record_drops_its_season_all_the_same(nflverse):
@@ -572,12 +573,132 @@ def test_a_loader_outside_a_record_drops_its_season_all_the_same(nflverse):
 def test_a_record_hands_the_thread_back_to_the_one_around_it(nflverse):
     """Each block takes the drops inside it and leaves the block outside its own."""
     nflverse(load_snap_counts=source(2025), load_injuries=source(2025))
-    with loader.collect_drops() as outer:
-        with loader.collect_drops() as inner:
+    with loader.collect_notices() as outer:
+        with loader.collect_notices() as inner:
             loader.load_snap_counts([2025, 2026])
         loader.load_injuries([2025, 2026])
-    assert inner == [("snap counts", 2026)]
-    assert outer == [("injuries", 2026)]
+    assert inner.dropped == [("snap counts", 2026)]
+    assert outer.dropped == [("injuries", 2026)]
+
+
+# ── A stored copy, where the fetch that would replace it fails ───────────────
+
+
+class Clock:
+    """Stand-in for the wall clock the cache stamps entries with."""
+
+    def __init__(self) -> None:
+        self.value = 1_000_000.0
+
+    def time(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> float:
+        self.value += seconds
+        return self.value
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    """Freeze the cache's clock, so an entry ages by exactly what a test advances it."""
+    fake = Clock()
+    monkeypatch.setattr(cache, "time", fake)
+    return fake
+
+
+def expired(nflverse, clock, absent=unavailable):
+    """A cached season one lifetime old, whose source has stopped answering for it."""
+    fake = nflverse(load_snap_counts=source(2025))
+    loader.load_snap_counts([2025])
+    clock.advance(cache.DEFAULT_TTL + 1)
+    fake.loaders["load_snap_counts"] = absent if callable(absent) else source()
+    return fake
+
+
+def test_a_stored_copy_answers_where_the_fetch_that_would_replace_it_fails(nflverse, clock):
+    """Losing the season is the worse of the two answers.
+
+    What sits behind an entry an hour past its lifetime has not changed in that hour,
+    and a request that fails is more often a transfer than a withdrawal.
+    """
+    expired(nflverse, clock, absent=source())
+    assert loader.load_snap_counts([2025])["season"].to_list() == [2025]
+
+
+def test_a_season_answered_from_a_stored_copy_is_recorded_with_its_age(nflverse, clock):
+    fake = nflverse(load_snap_counts=source(2025))
+    loader.load_snap_counts([2025])
+    clock.advance(cache.DEFAULT_TTL + 3600)
+    fake.loaders["load_snap_counts"] = source()
+    with loader.collect_notices() as notices:
+        loader.load_snap_counts([2025])
+    assert notices.dropped == []
+    assert notices.stale == [("snap counts", 2025, cache.DEFAULT_TTL + 3600)]
+
+
+def test_a_failed_fetch_with_no_copy_behind_it_drops_the_season(nflverse):
+    """The fallback is a copy to fall back to, not a reason to keep a season."""
+    nflverse(load_snap_counts=source())
+    with pytest.raises(RuntimeError, match="obtained for"):
+        loader.load_snap_counts([2026])
+
+
+def test_a_copy_answering_is_left_as_old_as_it_was(nflverse, clock, cache_dir):
+    """Restamping it would buy it another lifetime of looking fresh.
+
+    The entry keeps its age, so the next load asks the source again rather than being
+    handed the same copy as though it had just arrived.
+    """
+    fake = nflverse(load_snap_counts=source(2025))
+    loader.load_snap_counts([2025])
+    written = json.loads((cache_dir / "_meta.json").read_text())["snap_counts_2025"]["timestamp"]
+    clock.advance(cache.DEFAULT_TTL + 1)
+    fake.loaders["load_snap_counts"] = source()
+    loader.load_snap_counts([2025])
+    meta = json.loads((cache_dir / "_meta.json").read_text())
+    assert meta["snap_counts_2025"]["timestamp"] == written
+
+
+def test_a_source_that_answers_again_replaces_the_copy_that_stood_in(nflverse, clock):
+    fake = expired(nflverse, clock, absent=source())
+    loader.load_snap_counts([2025])
+    fake.loaders["load_snap_counts"] = lambda seasons: marked(9)
+    with loader.collect_notices() as notices:
+        assert loader.load_snap_counts([2025])["marker"].to_list() == [9]
+    assert notices.stale == []
+
+
+def test_a_timed_out_fetch_falls_back_to_the_copy_it_could_not_replace(nflverse, clock):
+    """A deadline reached is the other shape a fetch that did not return takes."""
+
+    def stalled(seasons: list[int]) -> pl.DataFrame:
+        raise TimeoutError("Download timed out after 120s.")
+
+    expired(nflverse, clock, absent=stalled)
+    assert loader.load_snap_counts([2025])["season"].to_list() == [2025]
+
+
+def test_a_failure_that_is_not_the_fetch_failing_reaches_for_no_copy(nflverse, clock):
+    """A stored copy answers a source that did not give, not a fault in this repository."""
+
+    def refuse(seasons: list[int]) -> pl.DataFrame:
+        raise RuntimeError("upstream refused the request")
+
+    expired(nflverse, clock, absent=refuse)
+    with pytest.raises(RuntimeError, match="upstream refused"):
+        loader.load_snap_counts([2025])
+
+
+def test_a_refresh_that_fails_keeps_what_it_meant_to_replace(nflverse, clock):
+    """Refresh promises a fresh download, not the loss of what it failed to refresh."""
+    fake = nflverse(load_snap_counts=source(2025))
+    loader.load_snap_counts([2025])
+    clock.advance(7200)
+    fake.loaders["load_snap_counts"] = source()
+    with loader.collect_notices() as notices:
+        frame = loader.load_snap_counts([2025], force_refresh=True)
+    assert frame["season"].to_list() == [2025]
+    assert notices.stale == [("snap counts", 2025, 7200)]
 
 
 # ── Seasons the source has not published ─────────────────────────────────────

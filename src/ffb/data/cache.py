@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -129,13 +130,18 @@ def _evict_lru(meta: dict[str, dict[str, Any]]) -> None:
         total -= sizes[key]
 
 
-def get(key: str, ttl: int = DEFAULT_TTL) -> pl.DataFrame | None:
-    """Return cached DataFrame if fresh, None if stale or missing."""
+def _read(key: str, ttl: float) -> tuple[pl.DataFrame, float] | None:
+    """Return the entry under `key` with its age in seconds, or None past `ttl`.
+
+    The age is measured from the write, not the last read: what a caller wants to know
+    is how old the data is, and reading it again does not make it newer.
+    """
     meta = _read_meta()
     entry = meta.get(key)
     if entry is None:
         return None
-    if time.time() - entry.get("timestamp", 0) > ttl:
+    age = time.time() - entry.get("timestamp", 0)
+    if age > ttl:
         return None
     path = _entry_path(key)
     if not path.exists():
@@ -152,7 +158,23 @@ def get(key: str, ttl: int = DEFAULT_TTL) -> pl.DataFrame | None:
     except OSError as e:
         # An unwritable cache directory costs eviction ordering accuracy, not the read.
         log.debug("access time for '%s' not recorded: %s", key, e)
-    return df
+    return df, age
+
+
+def get(key: str, ttl: int = DEFAULT_TTL) -> pl.DataFrame | None:
+    """Return cached DataFrame if fresh, None if stale or missing."""
+    read = _read(key, ttl)
+    return None if read is None else read[0]
+
+
+def get_stale(key: str) -> tuple[pl.DataFrame, float] | None:
+    """Return the entry under `key` with its age, however far past its lifetime it is.
+
+    A caller reaches for this having failed to fetch what would have replaced it. An
+    entry too old to serve is still a better answer than nothing, and its age is what
+    lets the caller say which it gave.
+    """
+    return _read(key, math.inf)
 
 
 def put(key: str, df: pl.DataFrame) -> None:
