@@ -535,6 +535,51 @@ def test_a_stored_entry_is_recorded_under_the_key_it_was_stored_with(nflverse, c
     assert sorted(meta) == ["injuries_2024", "injuries_2025"]
 
 
+# ── The record of what a load dropped ────────────────────────────────────────
+
+
+def test_a_dropped_season_reaches_an_open_record(nflverse):
+    """A returned frame names the seasons it holds, and nothing names the ones it does not."""
+    nflverse(load_snap_counts=source(2025))
+    with loader.collect_drops() as dropped:
+        loader.load_snap_counts([2025, 2026])
+    assert dropped == [("snap counts", 2026)]
+
+
+def test_a_request_that_drops_nothing_records_nothing(nflverse):
+    nflverse(load_snap_counts=source(2025, 2026))
+    with loader.collect_drops() as dropped:
+        loader.load_snap_counts([2025, 2026])
+    assert dropped == []
+
+
+def test_a_record_names_every_dataset_its_block_dropped(nflverse):
+    """One load reaches several loaders, and each drops its seasons on its own."""
+    nflverse(load_snap_counts=source(), load_injuries=source(2025))
+    with loader.collect_drops() as dropped:
+        with pytest.raises(RuntimeError):
+            loader.load_snap_counts([2026])
+        loader.load_injuries([2025, 2026])
+    assert dropped == [("snap counts", 2026), ("injuries", 2026)]
+
+
+def test_a_loader_outside_a_record_drops_its_season_all_the_same(nflverse):
+    """The bookkeeping is the caller's to ask for; the tolerance is not conditional."""
+    nflverse(load_snap_counts=source(2025))
+    assert loader.load_snap_counts([2025, 2026])["season"].to_list() == [2025]
+
+
+def test_a_record_hands_the_thread_back_to_the_one_around_it(nflverse):
+    """Each block takes the drops inside it and leaves the block outside its own."""
+    nflverse(load_snap_counts=source(2025), load_injuries=source(2025))
+    with loader.collect_drops() as outer:
+        with loader.collect_drops() as inner:
+            loader.load_snap_counts([2025, 2026])
+        loader.load_injuries([2025, 2026])
+    assert inner == [("snap counts", 2026)]
+    assert outer == [("injuries", 2026)]
+
+
 # ── Seasons the source has not published ─────────────────────────────────────
 
 
