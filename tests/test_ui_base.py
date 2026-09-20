@@ -1179,17 +1179,54 @@ def holding(tmp_path, monkeypatch: pytest.MonkeyPatch):
     return install
 
 
-def test_the_dropped_message_names_the_dataset_and_the_season() -> None:
-    assert base.dropped_message([("play-by-play", 2026)]) == (
+def test_the_message_names_the_dataset_and_the_season_not_loaded() -> None:
+    notices = loader.LoadNotices(dropped=[("play-by-play", 2026)])
+    assert base.notices_message(notices) == (
         "Not loaded: play-by-play 2026. The filters offer the seasons that loaded."
     )
 
 
-def test_the_dropped_message_gathers_the_seasons_of_one_dataset() -> None:
+def test_the_message_gathers_the_seasons_of_one_dataset() -> None:
     """A dataset absent for two seasons is one phrase, not two."""
-    assert base.dropped_message([("weekly stats", 2026), ("weekly stats", 2025)]) == (
+    notices = loader.LoadNotices(dropped=[("weekly stats", 2026), ("weekly stats", 2025)])
+    assert base.notices_message(notices) == (
         "Not loaded: weekly stats 2025, 2026. The filters offer the seasons that loaded."
     )
+
+
+def test_the_message_names_what_came_from_an_earlier_copy() -> None:
+    notices = loader.LoadNotices(stale=[("snap counts", 2026, 50400.0)])
+    assert base.notices_message(notices) == (
+        "Served from an earlier copy, up to 14h old: snap counts 2026."
+    )
+
+
+def test_the_message_ages_a_copy_by_the_oldest_of_them() -> None:
+    """One age for the lot, and the one that overstates nothing is the largest."""
+    notices = loader.LoadNotices(
+        stale=[("snap counts", 2026, 3600.0), ("weekly stats", 2026, 302400.0)]
+    )
+    assert base.notices_message(notices) == (
+        "Served from an earlier copy, up to 4d old: snap counts 2026, weekly stats 2026."
+    )
+
+
+def test_the_message_reports_both_halves_when_a_load_has_both() -> None:
+    notices = loader.LoadNotices(
+        dropped=[("injuries", 2026)], stale=[("snap counts", 2026, 50400.0)]
+    )
+    assert base.notices_message(notices) == (
+        "Not loaded: injuries 2026. The filters offer the seasons that loaded. "
+        "Served from an earlier copy, up to 14h old: snap counts 2026."
+    )
+
+
+@pytest.mark.parametrize(
+    ("seconds", "phrase"),
+    [(30.0, "1m"), (600.0, "10m"), (3600.0, "1h"), (50400.0, "14h"), (302400.0, "4d")],
+)
+def test_an_age_reads_in_the_coarsest_unit_that_keeps_it(seconds: float, phrase: str) -> None:
+    assert base.age_phrase(seconds) == phrase
 
 
 @piloted
@@ -1220,6 +1257,29 @@ async def test_a_load_that_obtains_every_season_reports_nothing(holding) -> None
         await settle(pilot)
 
         assert notices(pilot) == []
+
+
+@piloted
+async def test_a_season_served_from_a_stored_copy_is_reported_on_screen(
+    holding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool showing yesterday's numbers looks exactly like one showing today's."""
+    holding(2025, 2026)
+    view = SnapCountView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        pilot.app.clear_notifications()
+
+        monkeypatch.setattr(cache, "get", lambda key, ttl=cache.DEFAULT_TTL: None)
+        holding()
+        view._start_load(force_refresh=False)
+        await settle(pilot)
+
+        severity, message = notices(pilot)[0]
+        assert severity == "warning"
+        assert message.startswith("Served from an earlier copy, up to ")
+        assert message.endswith(": snap counts 2025, 2026.")
 
 
 @piloted

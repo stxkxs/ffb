@@ -22,6 +22,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any
 
@@ -45,37 +46,62 @@ class _SeasonUnavailable(Exception):
     """Signals one season a request did not obtain."""
 
 
-#: Where `collect_drops` keeps the record open on this thread.
-_drops = threading.local()
+@dataclass(frozen=True, slots=True)
+class LoadNotices:
+    """What a load has to say about the data it returned beyond the data itself.
+
+    `dropped` names a dataset and season it did not obtain at all. `stale` names one it
+    served from a cache entry past its lifetime, with that entry's age in seconds,
+    because the fetch that would have replaced it failed.
+    """
+
+    dropped: list[tuple[str, int]] = field(default_factory=list)
+    stale: list[tuple[str, int, float]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """Whether the load has anything to report."""
+        return bool(self.dropped or self.stale)
+
+
+#: Where `collect_notices` keeps the record open on this thread.
+_notices = threading.local()
 
 
 @contextmanager
-def collect_drops() -> Iterator[list[tuple[str, int]]]:
-    """Record what the loaders drop inside this block, as (dataset, season) pairs.
+def collect_notices() -> Iterator[LoadNotices]:
+    """Record what the loaders could not obtain, or obtained only from an older copy.
 
-    A dropped season leaves no trace in what a loader returns: the frame carries the
-    seasons it obtained and nothing names the ones it did not, so a caller rendering
-    that frame has no way to tell a season the source has never published from one it
-    published an hour ago. This is how the caller finds out.
+    Neither leaves a trace in what a loader returns: the frame carries the seasons it
+    has and names neither the ones it lost nor the ones it took from a copy that should
+    have been replaced. A caller rendering that frame cannot tell a season the source
+    has never published from one it published an hour ago, nor last week's numbers from
+    this morning's. This is how the caller finds out.
 
     The record is per thread, and a load runs its loaders on one worker thread, so a
-    collector sees what its own load dropped and not what another dropped beside it.
-    Without a collector open the loaders record nothing.
+    collector sees what its own load did and not what another did beside it. Without a
+    collector open the loaders record nothing.
     """
-    record: list[tuple[str, int]] = []
-    outer = getattr(_drops, "record", None)
-    _drops.record = record
+    record = LoadNotices()
+    outer = getattr(_notices, "record", None)
+    _notices.record = record
     try:
         yield record
     finally:
-        _drops.record = outer
+        _notices.record = outer
 
 
 def _record_drop(label: str, season: int) -> None:
     """Add one dropped season to the open record, where a caller opened one."""
-    record = getattr(_drops, "record", None)
+    record = getattr(_notices, "record", None)
     if record is not None:
-        record.append((label, season))
+        record.dropped.append((label, season))
+
+
+def _record_stale(label: str, season: int, age: float) -> None:
+    """Add one season served from an expired entry to the open record."""
+    record = getattr(_notices, "record", None)
+    if record is not None:
+        record.stale.append((label, season, age))
 
 
 def _download(
@@ -195,8 +221,21 @@ def _cached(
     fetch: Callable[..., pl.DataFrame],
     *args: Any,
     force_refresh: bool,
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, float | None]:
     """Return the frame stored under `key`, fetching and storing it on a miss.
+
+    Answers the frame and, where the fetch failed and a stored copy answered in its
+    place, that copy's age in seconds; a fresh entry and a fetched frame both answer
+    `None`. A refresh that fails over a copy still inside its lifetime reports the age
+    too — the caller asked for the source and did not get it.
+
+    A fetch that fails where an expired entry exists serves the entry. The alternative
+    is losing the season altogether, which is the worse of the two: an hour after an
+    entry goes stale the data behind it has not changed, and a request that fails is
+    more often a transfer than a withdrawal. Only the two shapes a failed fetch takes
+    are caught — a season the source did not give, and a transfer that ran out of time.
+    Anything else reaching here is a fault in this repository and is not something an
+    old copy answers.
 
     `force_refresh` skips the cache read, not the write: the fetched frame replaces
     whatever the key held.
@@ -204,11 +243,18 @@ def _cached(
     if not force_refresh:
         cached = cache.get(key)
         if cached is not None:
-            return cached
+            return cached, None
 
-    df = fetch(*args)
+    try:
+        df = fetch(*args)
+    except (_SeasonUnavailable, TimeoutError):
+        stale = cache.get_stale(key)
+        if stale is None:
+            raise
+        return stale
+
     cache.put(key, df)
-    return df
+    return df, None
 
 
 def _seasons_phrase(seasons: list[int]) -> str:
@@ -235,6 +281,9 @@ def _by_season(
     season the source publishes between two requests is fetched by the second rather
     than served from a partial the first stored.
 
+    A season whose fetch fails but whose cache entry survives is served from that entry
+    rather than dropped, so the seasons this returns are not only the ones it reached.
+
     Raising on a request that resolves nothing keeps an empty frame out of the engines.
     The message names the seasons it obtained nothing for. What it does not name is a
     cause: a season drops on a missing asset and on a failed transfer alike, and the
@@ -247,11 +296,16 @@ def _by_season(
     dropped: list[int] = []
     for season in sorted(set(seasons)):
         try:
-            frames.append(_cached(f"{prefix}_{season}", fetch, season, force_refresh=force_refresh))
+            frame, age = _cached(f"{prefix}_{season}", fetch, season, force_refresh=force_refresh)
         except _SeasonUnavailable as e:
             log.warning("skipping %d, no %s obtained for it: %s", season, label, e)
             dropped.append(season)
             _record_drop(label, season)
+        else:
+            frames.append(frame)
+            if age is not None:
+                log.warning("serving %d %s from a copy %.0fs old", season, label, age)
+                _record_stale(label, season, age)
 
     if not frames:
         raise RuntimeError(f"No {label} obtained for {_seasons_phrase(dropped)}")
@@ -370,12 +424,18 @@ def _player_crosswalk() -> pl.DataFrame:
 def load_player_ids(
     force_refresh: bool = False,
 ) -> pl.DataFrame:
-    """Load player ID crosswalk table (pfr_id <-> gsis_id), with caching."""
-    return _cached(
+    """Load player ID crosswalk table (pfr_id <-> gsis_id), with caching.
+
+    The age of this one is not reported. It is a name-to-id table that changes when a
+    player enters the league, so a copy a day old answers every lookup the current one
+    would, and saying so would crowd out the notices about data that does move.
+    """
+    frame, _ = _cached(
         "player_ids",
         _player_crosswalk,
         force_refresh=force_refresh,
     )
+    return frame
 
 
 def load_schedules(

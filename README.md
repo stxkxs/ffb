@@ -162,12 +162,20 @@ transfer, and one that stays absent is waiting on the source. A season a loader 
 range is dropped the same way, and the ceiling it checks against is not the cut the season
 label turns on.
 
-The drop reaches the interface twice. A load that lost a season says so on screen —
-**`Not loaded: snap counts 2026. The filters offer the seasons that loaded.`** — naming
-the datasets and seasons and no cause, because the loaders have none to give. And every
-screen builds its season filter from the seasons its data carries rows for, so the
-absent season is absent from the filter and the filter opens on the newest season that
-has data. Start/Sit reads its week options off the
+A season is dropped only where there is nothing to fall back on. A fetch that fails
+over a copy already on disk is answered from that copy, however far past its six hours
+it is: what sits behind an entry an hour past its lifetime has not changed in that hour,
+and a request that fails is more often a transfer than a withdrawal. That is reported
+too — **`Served from an earlier copy, up to 30h old: snap counts 2025, 2026.`** — and
+the entry keeps its age, so the next load asks the source again rather than being handed
+the same copy as though it had just arrived.
+
+Where there is no copy, the drop reaches the interface twice. A load that lost a season
+says so on screen — **`Not loaded: snap counts 2026. The filters offer the seasons that
+loaded.`** — naming the datasets and seasons and no cause, because the loaders have none
+to give. And every screen builds its season filter from the seasons its data carries rows
+for, so the absent season is absent from the filter and the filter opens on the newest
+season that has data. Start/Sit reads its week options off the
 results for the same reason, not off the schedule: nflverse publishes a schedule months
 before the season opens, so a schedule alone would offer a week nothing can be projected
 for. Trade Value offers a season as soon as one of its weeks has been played, which is

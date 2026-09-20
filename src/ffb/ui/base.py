@@ -33,26 +33,51 @@ Result = TypeVar("Result")
 #: One filter's id paired with the value it holds.
 FilterState = tuple[tuple[str | None, Any], ...]
 
-#: What `fetch` hands back, paired with the seasons its loaders dropped getting it.
-Loaded = tuple[Any, list[tuple[str, int]]]
+#: What `fetch` hands back, paired with what its loaders have to report about it.
+Loaded = tuple[Any, loader.LoadNotices]
 
 
-def dropped_message(dropped: Iterable[tuple[str, int]]) -> str:
-    """Name the datasets and seasons a load did not obtain.
-
-    The message says what is absent and stops there. A release asset that does not
-    exist, a transfer that failed and a season a loader declined by range all reach the
-    loaders as one dropped season, so naming a cause would be a guess this layer is in
-    no position to make.
-    """
-    seasons: dict[str, list[int]] = {}
-    for label, season in dropped:
-        seasons.setdefault(label, []).append(season)
-    datasets = ", ".join(
+def _gathered(seasons: Iterable[tuple[str, int]]) -> str:
+    """Name each dataset once, with the seasons it is named for."""
+    datasets: dict[str, list[int]] = {}
+    for label, season in seasons:
+        datasets.setdefault(label, []).append(season)
+    return ", ".join(
         f"{label} {', '.join(str(season) for season in sorted(set(entries)))}"
-        for label, entries in seasons.items()
+        for label, entries in datasets.items()
     )
-    return f"Not loaded: {datasets}. The filters offer the seasons that loaded."
+
+
+def age_phrase(seconds: float) -> str:
+    """`seconds` in the coarsest unit that does not round it away."""
+    hours = seconds / 3600
+    if hours < 1:
+        return f"{max(1, round(seconds / 60))}m"
+    if hours < 48:
+        return f"{round(hours)}h"
+    return f"{round(hours / 24)}d"
+
+
+def notices_message(notices: loader.LoadNotices) -> str:
+    """Say what a load did not obtain, and what it obtained only from an older copy.
+
+    Each half says what happened and stops there. A release asset that does not exist,
+    a transfer that failed and a season a loader declined by range all reach the loaders
+    as the same outcome, so naming a cause would be a guess this layer is in no position
+    to make.
+    """
+    parts = []
+    if notices.dropped:
+        parts.append(
+            f"Not loaded: {_gathered(notices.dropped)}. The filters offer the seasons that loaded."
+        )
+    if notices.stale:
+        oldest = max(age for _, _, age in notices.stale)
+        parts.append(
+            f"Served from an earlier copy, up to {age_phrase(oldest)} old: "
+            f"{_gathered([(label, season) for label, season, _ in notices.stale])}."
+        )
+    return " ".join(parts)
 
 
 class ToolView(Widget):
@@ -273,13 +298,14 @@ class ToolView(Widget):
     def _load(self, force_refresh: bool) -> Loaded:
         """Run `fetch`, carrying back the seasons its loaders dropped reaching it.
 
-        A dropped season costs a tool a filter option and nothing else on screen, and
-        the warning the loaders write goes to a logger this interface does not show. The
-        record travels back with the payload so the view can say what is missing.
+        A dropped season costs a tool a filter option and nothing else on screen, and a
+        season served from an expired copy costs it nothing at all; the warnings the
+        loaders write go to a logger this interface does not show. The record travels
+        back with the payload so the view can say what happened.
         """
-        with loader.collect_drops() as dropped:
+        with loader.collect_notices() as notices:
             payload = self.fetch(force_refresh)
-        return payload, dropped
+        return payload, notices
 
     def run_off_thread(
         self,
@@ -316,7 +342,7 @@ class ToolView(Widget):
         self.notify(message, severity="error", timeout=10)
 
     def _on_data_loaded(self, loaded: Loaded) -> None:
-        payload, dropped = loaded
+        payload, notices = loaded
         self._loading = False
         self._stop_elapsed()
         try:
@@ -325,8 +351,8 @@ class ToolView(Widget):
             self._rendered_filters = self._filter_state()
         self._show_content()
         self.refresh_bindings()
-        if dropped:
-            self.notify(dropped_message(dropped), severity="warning", timeout=10)
+        if notices:
+            self.notify(notices_message(notices), severity="warning", timeout=10)
 
     def _on_data_error(self, error: str) -> None:
         self._loading = False
