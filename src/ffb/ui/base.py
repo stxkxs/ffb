@@ -15,6 +15,8 @@ from textual.widget import Widget
 from textual.widgets import Button, DataTable, LoadingIndicator, Select, Static
 from textual.worker import Worker, get_current_worker
 
+from ffb.data import loader
+
 #: Fantasy-relevant positions in depth-chart order, as the position filter lists them.
 POSITIONS: tuple[str, ...] = ("QB", "RB", "WR", "TE")
 
@@ -30,6 +32,27 @@ Result = TypeVar("Result")
 
 #: One filter's id paired with the value it holds.
 FilterState = tuple[tuple[str | None, Any], ...]
+
+#: What `fetch` hands back, paired with the seasons its loaders dropped getting it.
+Loaded = tuple[Any, list[tuple[str, int]]]
+
+
+def dropped_message(dropped: Iterable[tuple[str, int]]) -> str:
+    """Name the datasets and seasons a load did not obtain.
+
+    The message says what is absent and stops there. A release asset that does not
+    exist, a transfer that failed and a season a loader declined by range all reach the
+    loaders as one dropped season, so naming a cause would be a guess this layer is in
+    no position to make.
+    """
+    seasons: dict[str, list[int]] = {}
+    for label, season in dropped:
+        seasons.setdefault(label, []).append(season)
+    datasets = ", ".join(
+        f"{label} {', '.join(str(season) for season in sorted(set(entries)))}"
+        for label, entries in seasons.items()
+    )
+    return f"Not loaded: {datasets}. The filters offer the seasons that loaded."
 
 
 class ToolView(Widget):
@@ -237,7 +260,7 @@ class ToolView(Widget):
         self.query_one(f"#{self.ID_PREFIX}-loading").display = True
         self._start_elapsed()
         self._load_worker = self.run_off_thread(
-            lambda: self.fetch(force_refresh),
+            lambda: self._load(force_refresh),
             self._on_data_loaded,
             self._on_data_error,
             group="tool-load",
@@ -246,6 +269,17 @@ class ToolView(Widget):
         # cancel button is the one focusable widget on show during a load.
         self.query_one(f"#{self.ID_PREFIX}-btn-cancel", Button).focus()
         self.refresh_bindings()
+
+    def _load(self, force_refresh: bool) -> Loaded:
+        """Run `fetch`, carrying back the seasons its loaders dropped reaching it.
+
+        A dropped season costs a tool a filter option and nothing else on screen, and
+        the warning the loaders write goes to a logger this interface does not show. The
+        record travels back with the payload so the view can say what is missing.
+        """
+        with loader.collect_drops() as dropped:
+            payload = self.fetch(force_refresh)
+        return payload, dropped
 
     def run_off_thread(
         self,
@@ -281,7 +315,8 @@ class ToolView(Widget):
         """Show `message` as the error toast every failure in this view reports through."""
         self.notify(message, severity="error", timeout=10)
 
-    def _on_data_loaded(self, payload: object) -> None:
+    def _on_data_loaded(self, loaded: Loaded) -> None:
+        payload, dropped = loaded
         self._loading = False
         self._stop_elapsed()
         try:
@@ -290,6 +325,8 @@ class ToolView(Widget):
             self._rendered_filters = self._filter_state()
         self._show_content()
         self.refresh_bindings()
+        if dropped:
+            self.notify(dropped_message(dropped), severity="warning", timeout=10)
 
     def _on_data_error(self, error: str) -> None:
         self._loading = False

@@ -20,7 +20,8 @@ so no engine has to know two spellings for one thing.
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from functools import lru_cache, partial
 from typing import Any
 
@@ -42,6 +43,39 @@ _OUT_OF_RANGE = "Season must be between"
 
 class _SeasonUnavailable(Exception):
     """Signals one season a request did not obtain."""
+
+
+#: Where `collect_drops` keeps the record open on this thread.
+_drops = threading.local()
+
+
+@contextmanager
+def collect_drops() -> Iterator[list[tuple[str, int]]]:
+    """Record what the loaders drop inside this block, as (dataset, season) pairs.
+
+    A dropped season leaves no trace in what a loader returns: the frame carries the
+    seasons it obtained and nothing names the ones it did not, so a caller rendering
+    that frame has no way to tell a season the source has never published from one it
+    published an hour ago. This is how the caller finds out.
+
+    The record is per thread, and a load runs its loaders on one worker thread, so a
+    collector sees what its own load dropped and not what another dropped beside it.
+    Without a collector open the loaders record nothing.
+    """
+    record: list[tuple[str, int]] = []
+    outer = getattr(_drops, "record", None)
+    _drops.record = record
+    try:
+        yield record
+    finally:
+        _drops.record = outer
+
+
+def _record_drop(label: str, season: int) -> None:
+    """Add one dropped season to the open record, where a caller opened one."""
+    record = getattr(_drops, "record", None)
+    if record is not None:
+        record.append((label, season))
 
 
 def _download(
@@ -217,6 +251,7 @@ def _by_season(
         except _SeasonUnavailable as e:
             log.warning("skipping %d, no %s obtained for it: %s", season, label, e)
             dropped.append(season)
+            _record_drop(label, season)
 
     if not frames:
         raise RuntimeError(f"No {label} obtained for {_seasons_phrase(dropped)}")

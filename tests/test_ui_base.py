@@ -21,6 +21,7 @@ from textual.pilot import Pilot
 from textual.widgets import Button, DataTable, Select, Static
 from textual.widgets._select import InvalidSelectValueError
 
+from ffb.data import cache, loader
 from ffb.injury_impact import screen as injury_impact_screen
 from ffb.red_zone import screen as red_zone_screen
 from ffb.snap_share import screen as snap_share_screen
@@ -135,10 +136,10 @@ def stub_loaders(
     recorder through the same reference its `fetch` calls.
     """
     for tool in TOOLS:
-        for loader, frame in frames.items():
-            if not hasattr(tool.module, loader):
+        for name, frame in frames.items():
+            if not hasattr(tool.module, name):
                 continue
-            monkeypatch.setattr(tool.module, loader, _recorder(tool.name, loader, frame, calls))
+            monkeypatch.setattr(tool.module, name, _recorder(tool.name, name, frame, calls))
 
 
 @pytest.fixture()
@@ -1128,3 +1129,115 @@ async def test_trade_value_says_so_when_no_season_carries_a_played_week(
             str(view.query_one("#tv-table-empty", Static).visual)
             == trade_value_screen.NO_PLAYED_WEEKS
         )
+
+
+# ── Seasons a load did not obtain ────────────────────────────────────────────
+
+
+def notices(pilot: Pilot[None]) -> list[tuple[str, str]]:
+    """Every toast the app is showing, as (severity, message)."""
+    return [
+        (notification.severity, notification.message) for notification in pilot.app._notifications
+    ]
+
+
+class SnapCountView(ToolView):
+    """A view whose fetch reaches the real loader, so a dropped season is a real drop."""
+
+    ID_PREFIX = "sc"
+    LOAD_LABEL = "Downloading snap counts"
+
+    def compose_content(self) -> ComposeResult:
+        yield DataTable(id="sc-table")
+
+    def on_mount(self) -> None:
+        self.query_one("#sc-table", DataTable).add_columns("Season")
+
+    def fetch(self, force_refresh: bool) -> pl.DataFrame:
+        return loader.load_snap_counts([2025, 2026], force_refresh=force_refresh)
+
+    def apply(self, payload: pl.DataFrame) -> None:
+        pass
+
+
+@pytest.fixture()
+def holding(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Install an nflreadpy stand-in publishing the named seasons and no others."""
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+
+    def install(*published: int) -> None:
+        def load_snap_counts(seasons: list[int]) -> pl.DataFrame:
+            for season in seasons:
+                if season not in published:
+                    raise ConnectionError("404 Client Error: Not Found")
+            return pl.DataFrame({"season": seasons})
+
+        module = ModuleType("nflreadpy")
+        module.load_snap_counts = load_snap_counts  # type: ignore[attr-defined]
+        monkeypatch.setattr(loader, "_nflreadpy", lambda: module)
+
+    return install
+
+
+def test_the_dropped_message_names_the_dataset_and_the_season() -> None:
+    assert base.dropped_message([("play-by-play", 2026)]) == (
+        "Not loaded: play-by-play 2026. The filters offer the seasons that loaded."
+    )
+
+
+def test_the_dropped_message_gathers_the_seasons_of_one_dataset() -> None:
+    """A dataset absent for two seasons is one phrase, not two."""
+    assert base.dropped_message([("weekly stats", 2026), ("weekly stats", 2025)]) == (
+        "Not loaded: weekly stats 2025, 2026. The filters offer the seasons that loaded."
+    )
+
+
+@piloted
+async def test_a_dropped_season_is_reported_on_screen(holding) -> None:
+    """The loaders write the drop to a logger this interface does not show.
+
+    Without the toast the season is absent from the filter and nothing says why, which
+    reads as a tool that has no such season rather than a load that lost one.
+    """
+    holding(2025)
+    view = SnapCountView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert notices(pilot) == [
+            ("warning", "Not loaded: snap counts 2026. The filters offer the seasons that loaded.")
+        ]
+
+
+@piloted
+async def test_a_load_that_obtains_every_season_reports_nothing(holding) -> None:
+    """A toast on a load that lost nothing would train the reader to dismiss them."""
+    holding(2025, 2026)
+    view = SnapCountView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+
+        assert notices(pilot) == []
+
+
+@piloted
+async def test_a_load_reports_only_the_seasons_it_dropped_itself(holding) -> None:
+    """A second load answers for itself: the first one's drops are not still standing.
+
+    The record is opened per load, so a season obtained on a retry stops being reported
+    rather than accumulating against the view.
+    """
+    holding(2025)
+    view = SnapCountView()
+    async with Host(view).run_test() as pilot:
+        view.activate()
+        await settle(pilot)
+        pilot.app.clear_notifications()
+
+        holding(2025, 2026)
+        view._start_load(force_refresh=True)
+        await settle(pilot)
+
+        assert notices(pilot) == []

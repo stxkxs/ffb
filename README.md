@@ -162,9 +162,12 @@ transfer, and one that stays absent is waiting on the source. A season a loader 
 range is dropped the same way, and the ceiling it checks against is not the cut the season
 label turns on.
 
-The drop reaches the interface, because every screen builds its season filter from the
-seasons its data carries rows for. The absent season is absent from the filter, and the
-filter opens on the newest season that has data. Start/Sit reads its week options off the
+The drop reaches the interface twice. A load that lost a season says so on screen —
+**`Not loaded: snap counts 2026. The filters offer the seasons that loaded.`** — naming
+the datasets and seasons and no cause, because the loaders have none to give. And every
+screen builds its season filter from the seasons its data carries rows for, so the
+absent season is absent from the filter and the filter opens on the newest season that
+has data. Start/Sit reads its week options off the
 results for the same reason, not off the schedule: nflverse publishes a schedule months
 before the season opens, so a schedule alone would offer a week nothing can be projected
 for. Trade Value offers a season as soon as one of its weeks has been played, which is
